@@ -2,8 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleName</key>
+    <string>ZenAmp</string>
+    <key>CFBundleDisplayName</key>
+    <string>ZenAmp</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>MusicButtons needs to control Apple Music to manage your tracks and playlists.</string>
+    <string>ZenAmp needs to control Apple Music to manage your tracks and playlists.</string>
     <key>NSQuitAlwaysKeepsWindows</key>
     <false/>
 </dict>

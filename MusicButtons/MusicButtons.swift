@@ -245,7 +245,7 @@ class MusicController {
                 set t to current track
                 if (count of artworks of t) > 0 then
                     set artData to data of artwork 1 of t
-                    set tmpPath to "/tmp/musicbuttons_art.jpg"
+                    set tmpPath to "/tmp/zenamp_art.jpg"
                     set fRef to open for access POSIX file tmpPath with write permission
                     set eof fRef to 0
                     write artData to fRef
@@ -604,7 +604,7 @@ class ButtonStore: ObservableObject {
 
     private static var settingsURL: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let dir = home.appendingPathComponent(".musicbuttons")
+        let dir = home.appendingPathComponent(".zenamp")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("settings.json")
     }
@@ -2134,7 +2134,7 @@ class AppState: ObservableObject {
 
     private static var prefsURL: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let dir = home.appendingPathComponent(".musicbuttons")
+        let dir = home.appendingPathComponent(".zenamp")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("prefs.json")
     }
@@ -2178,7 +2178,7 @@ enum AppMain {
 }
 
 @main
-struct MusicButtonsLauncher {
+struct ZenAmpLauncher {
     static func main() {
         AppMain.main()
     }
