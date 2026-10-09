@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CoreAudio
+import ImageIO
 
 // MARK: - Audio Output Manager
 
@@ -73,10 +74,26 @@ class AudioOutputManager {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var name: CFString = "" as CFString
-        var dataSize = UInt32(MemoryLayout<CFString>.size)
-        guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, &name) == noErr else { return nil }
-        return name as String
+        // CoreAudio hands back a +1 retained CFString; take ownership so it's released.
+        var name: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, &name) == noErr,
+              let name else { return nil }
+        return name.takeRetainedValue() as String
+    }
+}
+
+// MARK: - UI Scale
+
+private struct UIScaleKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 1
+}
+
+extension EnvironmentValues {
+    /// Zoom factor every hardcoded dimension in the player is multiplied by.
+    var uiScale: CGFloat {
+        get { self[UIScaleKey.self] }
+        set { self[UIScaleKey.self] = newValue }
     }
 }
 
@@ -88,24 +105,41 @@ struct AppKitButton: NSViewRepresentable {
     let color: NSColor
     let action: () -> Void
 
+    private static var symbolCache: [String: NSImage] = [:]
+
+    private static func cachedSymbol(name: String, size: CGFloat) -> NSImage? {
+        let key = "\(name)@\(size)"
+        if let cached = symbolCache[key] { return cached }
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: size, weight: .regular)) else { return nil }
+        symbolCache[key] = image
+        return image
+    }
+
     func makeNSView(context: Context) -> NSButton {
         let button = NSButton()
         button.bezelStyle = .inline
         button.isBordered = false
-        button.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: size, weight: .regular))
+        button.image = AppKitButton.cachedSymbol(name: icon, size: size)
         button.contentTintColor = color
         button.target = context.coordinator
         button.action = #selector(Coordinator.clicked)
         button.setContentHuggingPriority(.required, for: .horizontal)
         button.setContentHuggingPriority(.required, for: .vertical)
+        context.coordinator.currentIcon = icon
+        context.coordinator.currentSize = size
         return button
     }
 
     func updateNSView(_ button: NSButton, context: Context) {
-        button.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: size, weight: .regular))
-        button.contentTintColor = color
+        if context.coordinator.currentIcon != icon || context.coordinator.currentSize != size {
+            button.image = AppKitButton.cachedSymbol(name: icon, size: size)
+            context.coordinator.currentIcon = icon
+            context.coordinator.currentSize = size
+        }
+        if button.contentTintColor != color {
+            button.contentTintColor = color
+        }
         context.coordinator.action = action
     }
 
@@ -113,6 +147,8 @@ struct AppKitButton: NSViewRepresentable {
 
     class Coordinator: NSObject {
         var action: () -> Void
+        var currentIcon: String = ""
+        var currentSize: CGFloat = 0
         init(action: @escaping () -> Void) { self.action = action }
         @objc func clicked() { action() }
     }
@@ -126,8 +162,8 @@ struct AudioOutputMenuButton: NSViewRepresentable {
         let button = NSButton()
         button.bezelStyle = .inline
         button.isBordered = false
-        button.image = NSImage(systemSymbolName: "headphones", accessibilityDescription: "Audio Output")?
-            .withSymbolConfiguration(.init(pointSize: size, weight: .regular))
+        button.image = symbol()
+        context.coordinator.currentSize = size
         button.contentTintColor = color
         button.target = context.coordinator
         button.action = #selector(Coordinator.showMenu(_:))
@@ -137,12 +173,22 @@ struct AudioOutputMenuButton: NSViewRepresentable {
     }
 
     func updateNSView(_ button: NSButton, context: Context) {
+        if context.coordinator.currentSize != size {
+            button.image = symbol()
+            context.coordinator.currentSize = size
+        }
         button.contentTintColor = color
+    }
+
+    private func symbol() -> NSImage? {
+        NSImage(systemSymbolName: "headphones", accessibilityDescription: "Audio Output")?
+            .withSymbolConfiguration(.init(pointSize: size, weight: .regular))
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     class Coordinator: NSObject {
+        var currentSize: CGFloat = 0
         @objc func showMenu(_ sender: NSButton) {
             let menu = NSMenu()
             let devices = AudioOutputManager.listOutputDevices()
@@ -166,42 +212,86 @@ struct AudioOutputMenuButton: NSViewRepresentable {
 
 class MusicController {
 
+    private static let scriptTimeout: TimeInterval = 30
+
     static func runAppleScript(_ script: String, completion: @escaping (Bool, String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            let pipe = Pipe()
-            let errorPipe = Pipe()
+            autoreleasepool {
+                let process = Process()
+                let pipe = Pipe()
+                let errorPipe = Pipe()
 
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", script]
-            process.standardOutput = pipe
-            process.standardError = errorPipe
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", script]
+                process.standardOutput = pipe
+                process.standardError = errorPipe
 
-            do {
-                try process.run()
-                process.waitUntilExit()
+                do {
+                    let outHandle = pipe.fileHandleForReading
+                    let errHandle = errorPipe.fileHandleForReading
 
-                let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    try process.run()
 
-                DispatchQueue.main.async {
-                    if process.terminationStatus == 0 {
-                        completion(true, output)
-                    } else {
-                        completion(false, errorOutput.isEmpty ? "Unknown error" : errorOutput)
+                    // If Music is blocked (modal dialog, sync) the Apple Event can sit
+                    // for minutes — kill the script so callers always get a completion.
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + scriptTimeout) {
+                        if process.isRunning { process.terminate() }
                     }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    completion(false, error.localizedDescription)
+
+                    let outputData = outHandle.readDataToEndOfFile()
+                    let errorData = errHandle.readDataToEndOfFile()
+
+                    process.waitUntilExit()
+
+                    try? outHandle.close()
+                    try? errHandle.close()
+
+                    let output = String(data: outputData, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let errorOutput = String(data: errorData, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                    DispatchQueue.main.async {
+                        if process.terminationStatus == 0 {
+                            completion(true, output)
+                        } else {
+                            completion(false, errorOutput.isEmpty ? "Unknown error" : errorOutput)
+                        }
+                    }
+                } catch {
+                    try? pipe.fileHandleForReading.close()
+                    try? errorPipe.fileHandleForReading.close()
+                    DispatchQueue.main.async {
+                        completion(false, error.localizedDescription)
+                    }
                 }
             }
         }
     }
     
-    static func getCurrentTrackInfo(completion: @escaping (String?, String?, String?, Bool) -> Void) {
+    struct TrackInfo {
+        let name: String
+        let artist: String
+        let playlist: String
+        let isPlaying: Bool
+        let position: Double
+        let duration: Double
+    }
+
+    /// Track, play state and player position in a single script, so one poll is one process.
+    static func getCurrentTrackInfo(completion: @escaping (TrackInfo?) -> Void) {
+        let pidClause: String
+        if let pid = currentPlaylistPersistentID {
+            pidClause = """
+                    if playlistName is "" then
+                        try
+                            set playlistName to name of (first playlist whose persistent ID is "\(pid)")
+                        end try
+                    end if
+            """
+        } else {
+            pidClause = ""
+        }
         let script = """
         if application "Music" is not running then
             return "NOTHING_PLAYING"
@@ -218,22 +308,33 @@ class MusicController {
                         set playlistName to name of currentSource
                     end if
                 end try
-                return trackName & " | " & trackArtist & " | " & playlistName & " | " & isPlaying
+        \(pidClause)
+                set pos to 0
+                set dur to 0
+                try
+                    set pos to player position
+                    set dur to duration of current track
+                end try
+                return trackName & " | " & trackArtist & " | " & playlistName & " | " & isPlaying & " | " & (pos as text) & " | " & (dur as text)
             else
                 return "NOTHING_PLAYING"
             end if
         end tell
         """
         runAppleScript(script) { success, result in
-            if success && result != "NOTHING_PLAYING" {
-                let parts = result.components(separatedBy: " | ")
-                let name = parts.first
-                let artist = parts.count > 1 ? parts[1] : nil
-                let playlist = parts.count > 2 ? parts[2] : nil
-                let playing = parts.last == "true"
-                completion(name, artist, playlist, playing)
+            let parts = result.components(separatedBy: " | ")
+            if success && result != "NOTHING_PLAYING" && parts.count >= 6 {
+                let n = parts.count
+                completion(TrackInfo(
+                    name: parts[0],
+                    artist: parts[1],
+                    playlist: parts[2],
+                    isPlaying: parts[n - 3] == "true",
+                    position: Double(parts[n - 2]) ?? 0,
+                    duration: Double(parts[n - 1]) ?? 0
+                ))
             } else {
-                completion(nil, nil, nil, false)
+                completion(nil)
             }
         }
     }
@@ -258,8 +359,19 @@ class MusicController {
         """
         runAppleScript(script) { success, result in
             if success && result != "NONE" {
-                let image = NSImage(contentsOfFile: result)
-                completion(image)
+                // Decode straight to a thumbnail: the art is shown at 62pt (x2 zoom, x2 retina),
+                // so holding the full-size bitmap just wastes memory and slows every redraw.
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 256
+                ]
+                if let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: result) as CFURL, nil),
+                   let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                    completion(NSImage(cgImage: thumbnail, size: NSSize(width: thumbnail.width, height: thumbnail.height)))
+                } else {
+                    completion(nil)
+                }
             } else {
                 completion(nil)
             }
@@ -323,7 +435,28 @@ class MusicController {
         }
     }
 
-    static func fetchCurrentPlaylistTracks(completion: @escaping ([(name: String, artist: String, duration: String, isPlaying: Bool)]) -> Void) {
+    /// Stores the persistent ID of the playlist we last fetched, so playTrackAtIndex uses the same source
+    static var currentPlaylistPersistentID: String?
+
+    static func fetchCurrentPlaylistTracks(completion: @escaping ([(name: String, artist: String, duration: String, isPlaying: Bool, dbID: String)]) -> Void) {
+        // If we already know a playlist persistent ID, fetch from that playlist directly
+        // instead of relying on 'container of current track' which loses the playlist link
+        let srcSetup: String
+        if let pid = currentPlaylistPersistentID {
+            srcSetup = """
+                set src to first playlist whose persistent ID is "\(pid)"
+                set srcID to "playlist:" & (persistent ID of src)
+            """
+        } else {
+            srcSetup = """
+                set src to container of current track
+                set srcClass to class of src
+                set srcID to ""
+                if srcClass is playlist then
+                    set srcID to "playlist:" & (persistent ID of src)
+                end if
+            """
+        }
         let script = """
         tell application "Music"
             set currentName to ""
@@ -335,17 +468,19 @@ class MusicController {
                 end if
             end try
             try
-                set src to container of current track
+                \(srcSetup)
                 set allNames to name of tracks of src
                 set allArtists to artist of tracks of src
                 set allDurs to duration of tracks of src
+                set allIDs to database ID of tracks of src
                 set maxTracks to count of allNames
                 if maxTracks > 200 then set maxTracks to 200
-                set output to {}
+                set output to {srcID}
                 repeat with i from 1 to maxTracks
                     set tName to item i of allNames
                     set tArtist to item i of allArtists
                     set tDur to item i of allDurs
+                    set tID to item i of allIDs
                     set mins to (tDur div 60) as integer
                     set secs to (tDur mod 60) as integer
                     if secs < 10 then
@@ -357,7 +492,7 @@ class MusicController {
                     if tName is currentName and tArtist is currentArtist then
                         set isNowPlaying to "1"
                     end if
-                    set end of output to tName & ":::" & tArtist & ":::" & durStr & ":::" & isNowPlaying
+                    set end of output to tName & ":::" & tArtist & ":::" & durStr & ":::" & isNowPlaying & ":::" & (tID as text)
                 end repeat
                 set AppleScript's text item delimiters to "|||"
                 return output as text
@@ -367,10 +502,20 @@ class MusicController {
         """
         runAppleScript(script) { success, result in
             if success && !result.isEmpty {
-                let tracks = result.components(separatedBy: "|||").compactMap { line -> (name: String, artist: String, duration: String, isPlaying: Bool)? in
+                var lines = result.components(separatedBy: "|||")
+                // First element is the source ID
+                if let first = lines.first {
+                    lines.removeFirst()
+                    if first.hasPrefix("playlist:") {
+                        currentPlaylistPersistentID = String(first.dropFirst("playlist:".count))
+                    } else if currentPlaylistPersistentID == nil {
+                        // Only clear if we didn't already have one — don't lose it
+                    }
+                }
+                let tracks = lines.compactMap { line -> (name: String, artist: String, duration: String, isPlaying: Bool, dbID: String)? in
                     let parts = line.components(separatedBy: ":::")
-                    guard parts.count >= 4 else { return nil }
-                    return (name: parts[0], artist: parts[1], duration: parts[2], isPlaying: parts[3] == "1")
+                    guard parts.count >= 5 else { return nil }
+                    return (name: parts[0], artist: parts[1], duration: parts[2], isPlaying: parts[3] == "1", dbID: parts[4])
                 }
                 completion(tracks)
             } else {
@@ -379,17 +524,34 @@ class MusicController {
         }
     }
 
-    static func playTrackAtIndex(_ index: Int, completion: @escaping (Bool) -> Void) {
-        let script = """
-        tell application "Music"
-            try
-                set src to view of front window
-                play track \(index + 1) of src
-                return "ok"
-            end try
-            return "error"
-        end tell
-        """
+    static func playTrackByDatabaseID(_ dbID: String, playlistPersistentID: String?, completion: @escaping (Bool) -> Void) {
+        let script: String
+        if let pid = playlistPersistentID {
+            // Play the track within the playlist context so Music stays on the playlist
+            script = """
+            tell application "Music"
+                try
+                    set pl to first playlist whose persistent ID is "\(pid)"
+                    set t to (first track of pl whose database ID is \(dbID))
+                    play t
+                    return "ok"
+                end try
+                return "error"
+            end tell
+            """
+        } else {
+            script = """
+            tell application "Music"
+                try
+                    set src to container of current track
+                    set t to (first track of src whose database ID is \(dbID))
+                    play t
+                    return "ok"
+                end try
+                return "error"
+            end tell
+            """
+        }
         runAppleScript(script) { success, _ in
             completion(success)
         }
@@ -423,29 +585,25 @@ class MusicController {
         }
     }
 
+    private static var volumeSendInFlight = false
+    private static var pendingVolume: Int?
+
+    /// Coalesces slider drags: at most one script in flight, and the latest value always wins.
+    /// Call on the main thread.
     static func setVolume(_ volume: Double) {
         let v = Int(max(0, min(100, volume)))
+        if volumeSendInFlight {
+            pendingVolume = v
+            return
+        }
+        volumeSendInFlight = true
         let script = "tell application \"Music\" to set sound volume to \(v)"
-        runAppleScript(script) { _, _ in }
-    }
-
-    static func getPlayerPosition(completion: @escaping (Double, Double) -> Void) {
-        let script = """
-        tell application "Music"
-            if player state is playing or player state is paused then
-                set pos to player position
-                set dur to duration of current track
-                return (pos as text) & "|" & (dur as text)
-            else
-                return "0|0"
-            end if
-        end tell
-        """
-        runAppleScript(script) { success, result in
-            let parts = result.components(separatedBy: "|")
-            let pos = Double(parts.first ?? "0") ?? 0
-            let dur = Double(parts.last ?? "0") ?? 0
-            completion(pos, dur)
+        runAppleScript(script) { _, _ in
+            volumeSendInFlight = false
+            if let next = pendingVolume {
+                pendingVolume = nil
+                setVolume(Double(next))
+            }
         }
     }
 
@@ -633,6 +791,7 @@ class ButtonStore: ObservableObject {
 // MARK: - Settings View
 
 struct SettingsView: View {
+    @Environment(\.uiScale) private var zoom
     @ObservedObject var store: ButtonStore
     @Binding var isShowing: Bool
     @State private var editingButtons: [ButtonConfig] = []
@@ -644,9 +803,9 @@ struct SettingsView: View {
             HStack {
                 Button(action: { withAnimation(.easeInOut(duration: 0.2)) { isShowing = false } }) {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 12 * zoom, weight: .semibold))
                     Text("Back")
-                        .font(.system(size: 12))
+                        .font(.system(size: 12 * zoom))
                 }
                 .buttonStyle(PlainButtonStyle())
                 .foregroundColor(.secondary)
@@ -654,22 +813,22 @@ struct SettingsView: View {
                 Spacer()
 
                 Text("Settings")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 13 * zoom, weight: .semibold))
 
                 Spacer()
 
                 // Invisible spacer to balance the header
-                Button(action: {}) { Text("Back").font(.system(size: 12)) }
+                Button(action: {}) { Text("Back").font(.system(size: 12 * zoom)) }
                     .hidden()
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 16 * zoom)
+            .padding(.vertical, 12 * zoom)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
 
             Divider()
 
             ScrollView {
-                VStack(spacing: 16) {
+                VStack(spacing: 16 * zoom) {
                     ForEach($editingButtons) { $button in
                         ButtonSettingsRow(config: $button, playlists: playlists)
                     }
@@ -678,10 +837,10 @@ struct SettingsView: View {
                     // Visualizer picker
                     HStack {
                         Image(systemName: AppState.shared.visualizerMode.icon)
-                            .font(.system(size: 12))
+                            .font(.system(size: 12 * zoom))
                             .foregroundColor(.secondary)
                         Text("Visualizer")
-                            .font(.system(size: 12))
+                            .font(.system(size: 12 * zoom))
                         Spacer()
                         Picker("", selection: Binding(
                             get: { AppState.shared.visualizerMode },
@@ -694,29 +853,29 @@ struct SettingsView: View {
                         .pickerStyle(.menu)
                         .controlSize(.small)
                     }
-                    .padding(12)
+                    .padding(12 * zoom)
                     .background(
-                        RoundedRectangle(cornerRadius: 8)
+                        RoundedRectangle(cornerRadius: 8 * zoom)
                             .fill(Color(nsColor: .controlBackgroundColor).opacity(0.3))
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color(nsColor: .separatorColor).opacity(0.3), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8 * zoom)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.3), lineWidth: 1 * zoom)
                     )
                 }
-                .padding(16)
+                .padding(16 * zoom)
             }
 
             Divider()
 
             // Footer buttons
-            HStack(spacing: 12) {
+            HStack(spacing: 12 * zoom) {
                 Button("Reset") {
                     editingButtons = ButtonConfig.defaults
                 }
                 .buttonStyle(PlainButtonStyle())
                 .foregroundColor(.secondary)
-                .font(.system(size: 11))
+                .font(.system(size: 11 * zoom))
 
                 Spacer()
 
@@ -727,15 +886,15 @@ struct SettingsView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
                 .foregroundColor(.blue)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 12 * zoom, weight: .semibold))
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 16 * zoom)
+            .padding(.vertical, 10 * zoom)
         }
-        .frame(width: 300)
+        .frame(width: 300 * zoom)
         .background(VisualEffectView())
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.2), radius: 8, x: 0, y: 4)
+        .clipShape(RoundedRectangle(cornerRadius: 12 * zoom))
+        .shadow(color: .black.opacity(0.2), radius: 8 * zoom, x: 0, y: 4 * zoom)
         .onAppear {
             editingButtons = store.buttons
             MusicController.fetchPlaylists { names in
@@ -746,24 +905,25 @@ struct SettingsView: View {
 }
 
 struct ButtonSettingsRow: View {
+    @Environment(\.uiScale) private var zoom
     @Binding var config: ButtonConfig
     var playlists: [String] = []
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8 * zoom) {
             // Preview
-            HStack(spacing: 10) {
+            HStack(spacing: 10 * zoom) {
                 ZStack {
                     Circle()
                         .fill(config.color.opacity(0.15))
-                        .frame(width: 30, height: 30)
+                        .frame(width: 30 * zoom, height: 30 * zoom)
                     Image(systemName: config.icon)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 13 * zoom, weight: .semibold))
                         .foregroundColor(config.color)
                 }
 
                 Text(config.title.isEmpty ? "Untitled" : config.title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 12 * zoom, weight: .semibold))
                     .foregroundColor(config.title.isEmpty ? .secondary : .primary)
 
                 Spacer()
@@ -772,26 +932,26 @@ struct ButtonSettingsRow: View {
             // Title field
             HStack {
                 Text("Label")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * zoom))
                     .foregroundColor(.secondary)
-                    .frame(width: 48, alignment: .trailing)
+                    .frame(width: 48 * zoom, alignment: .trailing)
                 TextField("Button name", text: $config.title)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * zoom))
             }
 
             // Action type
             HStack {
                 Text("Action")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * zoom))
                     .foregroundColor(.secondary)
-                    .frame(width: 48, alignment: .trailing)
+                    .frame(width: 48 * zoom, alignment: .trailing)
                 Picker("", selection: $config.isFavorite) {
                     Text("♥ Favorite Track").tag(true)
                     Text("Add to Playlist").tag(false)
                 }
                 .pickerStyle(MenuPickerStyle())
-                .font(.system(size: 11))
+                .font(.system(size: 11 * zoom))
                 .labelsHidden()
             }
 
@@ -799,13 +959,13 @@ struct ButtonSettingsRow: View {
             if !config.isFavorite {
                 HStack {
                     Text("Playlist")
-                        .font(.system(size: 10))
+                        .font(.system(size: 10 * zoom))
                         .foregroundColor(.secondary)
-                        .frame(width: 48, alignment: .trailing)
+                        .frame(width: 48 * zoom, alignment: .trailing)
                     if playlists.isEmpty {
                         TextField("Playlist name", text: $config.playlist)
                             .textFieldStyle(RoundedBorderTextFieldStyle())
-                            .font(.system(size: 11))
+                            .font(.system(size: 11 * zoom))
                     } else {
                         Picker("", selection: $config.playlist) {
                             Text("Select playlist...").tag("")
@@ -814,7 +974,7 @@ struct ButtonSettingsRow: View {
                             }
                         }
                         .pickerStyle(MenuPickerStyle())
-                        .font(.system(size: 11))
+                        .font(.system(size: 11 * zoom))
                         .labelsHidden()
                     }
                 }
@@ -823,19 +983,19 @@ struct ButtonSettingsRow: View {
             // Color picker
             HStack {
                 Text("Color")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * zoom))
                     .foregroundColor(.secondary)
-                    .frame(width: 48, alignment: .trailing)
-                HStack(spacing: 6) {
+                    .frame(width: 48 * zoom, alignment: .trailing)
+                HStack(spacing: 6 * zoom) {
                     ForEach(ButtonConfig.availableColors, id: \.self) { colorName in
                         Circle()
                             .fill(colorFor(colorName))
-                            .frame(width: 16, height: 16)
+                            .frame(width: 16 * zoom, height: 16 * zoom)
                             .overlay(
                                 Circle()
                                     .stroke(Color.white, lineWidth: config.colorName == colorName ? 2 : 0)
                             )
-                            .shadow(color: config.colorName == colorName ? colorFor(colorName).opacity(0.5) : .clear, radius: 3)
+                            .shadow(color: config.colorName == colorName ? colorFor(colorName).opacity(0.5) : .clear, radius: 3 * zoom)
                             .onTapGesture { config.colorName = colorName }
                     }
                 }
@@ -844,18 +1004,18 @@ struct ButtonSettingsRow: View {
             // Icon picker
             HStack(alignment: .top) {
                 Text("Icon")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * zoom))
                     .foregroundColor(.secondary)
-                    .frame(width: 48, alignment: .trailing)
-                    .padding(.top, 2)
+                    .frame(width: 48 * zoom, alignment: .trailing)
+                    .padding(.top, 2 * zoom)
 
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(22), spacing: 4), count: 8), spacing: 4) {
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(22 * zoom), spacing: 4 * zoom), count: 8), spacing: 4 * zoom) {
                     ForEach(ButtonConfig.availableIcons, id: \.self) { iconName in
                         Image(systemName: iconName)
-                            .font(.system(size: 11))
-                            .frame(width: 22, height: 22)
+                            .font(.system(size: 11 * zoom))
+                            .frame(width: 22 * zoom, height: 22 * zoom)
                             .background(
-                                RoundedRectangle(cornerRadius: 4)
+                                RoundedRectangle(cornerRadius: 4 * zoom)
                                     .fill(config.icon == iconName ? config.color.opacity(0.2) : Color.clear)
                             )
                             .foregroundColor(config.icon == iconName ? config.color : .secondary)
@@ -864,14 +1024,14 @@ struct ButtonSettingsRow: View {
                 }
             }
         }
-        .padding(12)
+        .padding(12 * zoom)
         .background(
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 8 * zoom)
                 .fill(Color(nsColor: .controlBackgroundColor).opacity(0.3))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(nsColor: .separatorColor).opacity(0.3), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 8 * zoom)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.3), lineWidth: 1 * zoom)
         )
     }
 
@@ -894,7 +1054,6 @@ struct ButtonSettingsRow: View {
 
 struct ContentView: View {
     @StateObject private var buttonStore = ButtonStore()
-    @StateObject private var waveformEngine = WaveformEngine()
     @ObservedObject private var appState = AppState.shared
     @State private var currentTrack: String = ""
     @State private var currentArtist: String = ""
@@ -908,14 +1067,19 @@ struct ContentView: View {
     @State private var playlists: [String] = []
     @State private var shuffleEnabled: Bool = false
     @State private var albumArt: NSImage? = nil
-    @State private var previousArt: NSImage? = nil
-    @State private var artTransition: Bool = false
     @State private var lastArtTrack: String = ""
     @State private var volume: Double = 50
     @State private var playerPosition: Double = 0
     @State private var trackDuration: Double = 0
+    @State private var refreshesInFlight: Int = 0
+    // Last position Music reported and when — the progress bar advances from this locally.
+    @State private var positionAnchor: Double = 0
+    @State private var positionAnchorDate: Date = Date()
 
-    let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+    // Music posts this on track change / play / pause, so polling is only a safety net.
+    private let playerInfoChanged = DistributedNotificationCenter.default()
+        .publisher(for: Notification.Name("com.apple.Music.playerInfo"))
+    let timer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
     let positionTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -926,7 +1090,6 @@ struct ContentView: View {
             } else {
                 WinampView(
                     buttonStore: buttonStore,
-                    waveformEngine: waveformEngine,
                     currentTrack: $currentTrack,
                     currentArtist: $currentArtist,
                     currentPlaylist: $currentPlaylist,
@@ -954,10 +1117,18 @@ struct ContentView: View {
             // Playlist scroller — below the main player
             if appState.showPlaylist {
             PlaylistScrollerView(isShowing: $appState.showPlaylist, currentPlaylist: $currentPlaylist, currentTrack: $currentTrack, refreshTrackInfo: refreshTrackInfo)
-                .frame(height: 250)
+                .frame(height: 250 * appState.zoomLevel)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
         }
         } // end VStack
+        // Sizes are multiplied by the zoom rather than using scaleEffect, which
+        // stretches the 1x rasterised layers and blurs text and icons.
+        .environment(\.uiScale, CGFloat(appState.zoomLevel))
+        .frame(
+            width: 300 * appState.zoomLevel,
+            height: (520 + (appState.showExpandedArt ? 300 : 0) + (appState.showPlaylist ? 250 : 0)) * appState.zoomLevel,
+            alignment: .topLeading
+        )
         .animation(.easeInOut(duration: 0.25), value: appState.showPlaylist)
         .onAppear {
             refreshTrackInfo()
@@ -965,12 +1136,28 @@ struct ContentView: View {
             MusicController.getShuffleState { enabled in shuffleEnabled = enabled }
             MusicController.getVolume { v in volume = v }
         }
-        .onReceive(timer) { _ in refreshTrackInfo() }
+        .onReceive(playerInfoChanged) { _ in
+            refreshTrackInfo()
+        }
+        .onReceive(timer) { _ in
+            // Fallback resync; skipped while a refresh is still running so a slow
+            // Music can't stack up scripts, and while nobody can see the window.
+            guard refreshesInFlight == 0, appState.isWindowVisible else { return }
+            refreshTrackInfo()
+        }
         .onReceive(positionTimer) { _ in
-            MusicController.getPlayerPosition { pos, dur in
-                playerPosition = pos
-                trackDuration = dur
+            guard isPlaying, trackDuration > 0 else { return }
+            let estimated = positionAnchor + Date().timeIntervalSince(positionAnchorDate)
+            if estimated >= trackDuration {
+                playerPosition = trackDuration
+                // Track should have ended — pick up whatever is playing now.
+                if refreshesInFlight == 0 { refreshTrackInfo() }
+            } else {
+                playerPosition = estimated
             }
+        }
+        .onChange(of: appState.isWindowVisible) { _, visible in
+            if visible { refreshTrackInfo() }
         }
     }
 
@@ -978,10 +1165,11 @@ struct ContentView: View {
     func resizeWindow() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             if let window = AppDelegate.shared?.mainWindow {
-                let baseWidth: CGFloat = 300
-                let artHeight: CGFloat = self.appState.showExpandedArt ? 300 : 0
-                let baseHeight: CGFloat = 520
-                let playlistHeight: CGFloat = self.appState.showPlaylist ? 250 : 0
+                let zoom = CGFloat(self.appState.zoomLevel)
+                let baseWidth: CGFloat = 300 * zoom
+                let artHeight: CGFloat = self.appState.showExpandedArt ? 300 * zoom : 0
+                let baseHeight: CGFloat = 520 * zoom
+                let playlistHeight: CGFloat = self.appState.showPlaylist ? 250 * zoom : 0
                 let targetWidth = baseWidth
                 let targetHeight = baseHeight + artHeight + playlistHeight
 
@@ -997,27 +1185,27 @@ struct ContentView: View {
     }
 
     func refreshTrackInfo() {
-        MusicController.getCurrentTrackInfo { name, artist, playlist, playing in
+        refreshesInFlight += 1
+        MusicController.getCurrentTrackInfo { info in
+            refreshesInFlight -= 1
             withAnimation(.easeInOut(duration: 0.2)) {
-                currentTrack = name ?? ""
-                currentArtist = artist ?? ""
-                currentPlaylist = playlist ?? ""
-                isPlaying = playing
+                currentTrack = info?.name ?? ""
+                currentArtist = info?.artist ?? ""
+                currentPlaylist = info?.playlist ?? ""
+                isPlaying = info?.isPlaying ?? false
             }
+            positionAnchor = info?.position ?? 0
+            positionAnchorDate = Date()
+            playerPosition = info?.position ?? 0
+            trackDuration = info?.duration ?? 0
             // Only fetch artwork when track changes — crossfade
-            let trackKey = (name ?? "") + (artist ?? "")
+            let trackKey = (info?.name ?? "") + (info?.artist ?? "")
             if trackKey != lastArtTrack {
                 lastArtTrack = trackKey
-                if name != nil {
+                if info != nil {
                     MusicController.fetchArtwork { image in
-                        previousArt = albumArt
-                        artTransition = true
                         withAnimation(.easeInOut(duration: 0.6)) {
                             albumArt = image
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-                            previousArt = nil
-                            artTransition = false
                         }
                     }
                 } else {
@@ -1062,6 +1250,7 @@ struct ContentView: View {
 // MARK: - Action Button
 
 struct ActionButton: View {
+    @Environment(\.uiScale) private var zoom
     let title: String
     let subtitle: String
     let icon: String
@@ -1074,46 +1263,46 @@ struct ActionButton: View {
     
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
+            HStack(spacing: 12 * zoom) {
                 ZStack {
                     Circle()
                         .fill(color.opacity(0.15))
-                        .frame(width: 36, height: 36)
+                        .frame(width: 36 * zoom, height: 36 * zoom)
                     
                     if isLoading {
                         ProgressView()
-                            .scaleEffect(0.5)
+                            .scaleEffect(0.5 * zoom)
                     } else {
                         Image(systemName: icon)
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(.system(size: 15 * zoom, weight: .semibold))
                             .foregroundColor(color)
                     }
                 }
                 
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 1 * zoom) {
                     Text(title)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 13 * zoom, weight: .semibold))
                         .foregroundColor(.primary)
                     Text(subtitle)
-                        .font(.system(size: 10))
+                        .font(.system(size: 10 * zoom))
                         .foregroundColor(.secondary)
                 }
                 
                 Spacer()
                 
                 Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 16))
+                    .font(.system(size: 16 * zoom))
                     .foregroundColor(color.opacity(isHovered ? 1.0 : 0.5))
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 12 * zoom)
+            .padding(.vertical, 10 * zoom)
             .background(
-                RoundedRectangle(cornerRadius: 10)
+                RoundedRectangle(cornerRadius: 10 * zoom)
                     .fill(isPressed ? color.opacity(0.1) : (isHovered ? color.opacity(0.06) : Color.clear))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(isHovered ? color.opacity(0.3) : Color.clear, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 10 * zoom)
+                    .stroke(isHovered ? color.opacity(0.3) : Color.clear, lineWidth: 1 * zoom)
             )
         }
         .buttonStyle(PlainButtonStyle())
@@ -1132,52 +1321,9 @@ struct ActionButton: View {
 
 // MARK: - Audio Waveform Visualizer
 
-class WaveformEngine: ObservableObject {
-    @Published var levels: [CGFloat] = Array(repeating: 0, count: 32)
-    private var displayLink: CVDisplayLink?
-    private var phase: Double = 0
-    private var isAnimating = false
-
-    func start() {
-        guard !isAnimating else { return }
-        isAnimating = true
-        // Use a timer at 30fps for the waveform
-        Timer.scheduledTimer(withTimeInterval: 1.0/30.0, repeats: true) { [weak self] timer in
-            guard let self = self, self.isAnimating else {
-                timer.invalidate()
-                return
-            }
-            self.phase += 0.15
-            var newLevels = [CGFloat]()
-            for i in 0..<32 {
-                let x = Double(i) / 32.0
-                // Combine multiple sine waves for organic look
-                let wave1 = sin(x * 4.0 + self.phase) * 0.3
-                let wave2 = sin(x * 7.0 + self.phase * 1.3) * 0.2
-                let wave3 = sin(x * 13.0 + self.phase * 0.7) * 0.15
-                let wave4 = cos(x * 3.0 + self.phase * 1.8) * 0.1
-                let noise = Double.random(in: -0.1...0.1)
-                let combined = (wave1 + wave2 + wave3 + wave4 + noise + 0.5)
-                newLevels.append(CGFloat(max(0.05, min(1.0, combined))))
-            }
-            DispatchQueue.main.async {
-                self.levels = newLevels
-            }
-        }
-    }
-
-    func stop() {
-        isAnimating = false
-        DispatchQueue.main.async {
-            withAnimation(.easeOut(duration: 0.5)) {
-                self.levels = Array(repeating: 0.05, count: 32)
-            }
-        }
-    }
-}
-
+/// Drawn in a single Canvas driven by a TimelineView: no timer, no published state,
+/// so each frame redraws only this view — and nothing at all while paused.
 struct AudioWaveformView: View {
-    @ObservedObject var engine: WaveformEngine
     var isPlaying: Bool
     var style: WaveformStyle
 
@@ -1195,99 +1341,110 @@ struct AudioWaveformView: View {
         }
     }
 
+    private static let barCount = 32
+    private static let barSpacing: CGFloat = 2
+    private static let idleLevels = [CGFloat](repeating: 0.05, count: barCount)
+
+    private static func levels(at time: TimeInterval) -> [CGFloat] {
+        let phase = time * 2.25
+        return (0..<barCount).map { i in
+            let x = Double(i) / Double(barCount)
+            // Combine multiple sine waves for organic look
+            let wave1 = sin(x * 4.0 + phase) * 0.3
+            let wave2 = sin(x * 7.0 + phase * 1.3) * 0.2
+            let wave3 = sin(x * 13.0 + phase * 0.7) * 0.15
+            let wave4 = cos(x * 3.0 + phase * 1.8) * 0.1
+            let noise = Double.random(in: -0.1...0.1)
+            let combined = (wave1 + wave2 + wave3 + wave4 + noise + 0.5)
+            return CGFloat(max(0.05, min(1.0, combined)))
+        }
+    }
+
     var body: some View {
-        GeometryReader { geo in
-            switch style {
-            case .bars:
-                barsView(size: geo.size)
-            case .mirror:
-                mirrorView(size: geo.size)
-            case .glow:
-                glowView(size: geo.size)
-            }
-        }
-        .onChange(of: isPlaying) { playing in
-            if playing { engine.start() } else { engine.stop() }
-        }
-        .onAppear {
-            if isPlaying { engine.start() }
-        }
-    }
-
-    func barsView(size: CGSize) -> some View {
-        HStack(spacing: 2) {
-            ForEach(0..<engine.levels.count, id: \.self) { i in
-                let level = engine.levels[i]
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(
-                        LinearGradient(
-                            colors: style.colors,
-                            startPoint: .bottom,
-                            endPoint: .top
-                        )
-                    )
-                    .frame(height: size.height * level)
-                    .frame(maxHeight: .infinity, alignment: .bottom)
-            }
-        }
-    }
-
-    func mirrorView(size: CGSize) -> some View {
-        HStack(spacing: 2) {
-            ForEach(0..<engine.levels.count, id: \.self) { i in
-                let level = engine.levels[i]
-                VStack(spacing: 1) {
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(
-                            LinearGradient(colors: style.colors, startPoint: .bottom, endPoint: .top)
-                        )
-                        .frame(height: size.height * 0.5 * level)
-                        .frame(maxHeight: .infinity, alignment: .bottom)
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(
-                            LinearGradient(colors: style.colors.map { $0.opacity(0.4) }, startPoint: .top, endPoint: .bottom)
-                        )
-                        .frame(height: size.height * 0.3 * level)
-                        .frame(maxHeight: .infinity, alignment: .top)
+        TimelineView(.animation(minimumInterval: 1.0 / 15.0, paused: !isPlaying)) { timeline in
+            let levels = isPlaying
+                ? Self.levels(at: timeline.date.timeIntervalSinceReferenceDate)
+                : Self.idleLevels
+            Canvas { context, size in
+                switch style {
+                case .bars: drawBars(levels, in: context, size: size)
+                case .mirror: drawMirror(levels, in: context, size: size)
+                case .glow: drawGlow(levels, in: context, size: size)
                 }
             }
         }
     }
 
-    func glowView(size: CGSize) -> some View {
-        Canvas { context, canvasSize in
-            let w = canvasSize.width
-            let h = canvasSize.height
-            let midY = h / 2
-            var path = Path()
-            for (i, level) in engine.levels.enumerated() {
-                let x = w * CGFloat(i) / CGFloat(engine.levels.count)
-                let y = midY + (level - 0.5) * h * 0.8
-                if i == 0 {
-                    path.move(to: CGPoint(x: x, y: y))
-                } else {
-                    let prevX = w * CGFloat(i - 1) / CGFloat(engine.levels.count)
-                    let cpX = (prevX + x) / 2
-                    path.addCurve(
-                        to: CGPoint(x: x, y: y),
-                        control1: CGPoint(x: cpX, y: path.currentPoint?.y ?? midY),
-                        control2: CGPoint(x: cpX, y: y)
-                    )
-                }
-            }
+    private func barWidth(for count: Int, in size: CGSize) -> CGFloat {
+        max(1, (size.width - Self.barSpacing * CGFloat(count - 1)) / CGFloat(count))
+    }
 
-            // Glow effect - draw multiple times with decreasing opacity
-            for blur in stride(from: 6.0, through: 0, by: -2) {
-                context.stroke(
-                    path,
-                    with: .linearGradient(
-                        Gradient(colors: style.colors),
-                        startPoint: CGPoint(x: 0, y: 0),
-                        endPoint: CGPoint(x: w, y: 0)
-                    ),
-                    lineWidth: 2 + blur
+    private func drawBars(_ levels: [CGFloat], in context: GraphicsContext, size: CGSize) {
+        let width = barWidth(for: levels.count, in: size)
+        let gradient = Gradient(colors: style.colors)
+        for (i, level) in levels.enumerated() {
+            let height = size.height * level
+            let rect = CGRect(x: CGFloat(i) * (width + Self.barSpacing), y: size.height - height, width: width, height: height)
+            context.fill(
+                Path(roundedRect: rect, cornerRadius: 1),
+                with: .linearGradient(gradient, startPoint: CGPoint(x: rect.midX, y: rect.maxY), endPoint: CGPoint(x: rect.midX, y: rect.minY))
+            )
+        }
+    }
+
+    private func drawMirror(_ levels: [CGFloat], in context: GraphicsContext, size: CGSize) {
+        let width = barWidth(for: levels.count, in: size)
+        let gradient = Gradient(colors: style.colors)
+        let reflection = Gradient(colors: style.colors.map { $0.opacity(0.4) })
+        let midY = size.height / 2
+        for (i, level) in levels.enumerated() {
+            let x = CGFloat(i) * (width + Self.barSpacing)
+            let upHeight = size.height * 0.5 * level
+            let up = CGRect(x: x, y: midY - 0.5 - upHeight, width: width, height: upHeight)
+            context.fill(
+                Path(roundedRect: up, cornerRadius: 1),
+                with: .linearGradient(gradient, startPoint: CGPoint(x: up.midX, y: up.maxY), endPoint: CGPoint(x: up.midX, y: up.minY))
+            )
+            let down = CGRect(x: x, y: midY + 0.5, width: width, height: size.height * 0.3 * level)
+            context.fill(
+                Path(roundedRect: down, cornerRadius: 1),
+                with: .linearGradient(reflection, startPoint: CGPoint(x: down.midX, y: down.minY), endPoint: CGPoint(x: down.midX, y: down.maxY))
+            )
+        }
+    }
+
+    private func drawGlow(_ levels: [CGFloat], in context: GraphicsContext, size: CGSize) {
+        let w = size.width
+        let h = size.height
+        let midY = h / 2
+        var path = Path()
+        for (i, level) in levels.enumerated() {
+            let x = w * CGFloat(i) / CGFloat(levels.count)
+            let y = midY + (level - 0.5) * h * 0.8
+            if i == 0 {
+                path.move(to: CGPoint(x: x, y: y))
+            } else {
+                let prevX = w * CGFloat(i - 1) / CGFloat(levels.count)
+                let cpX = (prevX + x) / 2
+                path.addCurve(
+                    to: CGPoint(x: x, y: y),
+                    control1: CGPoint(x: cpX, y: path.currentPoint?.y ?? midY),
+                    control2: CGPoint(x: cpX, y: y)
                 )
             }
+        }
+
+        // Glow effect - draw multiple times with decreasing opacity
+        for blur in stride(from: 6.0, through: 0, by: -2) {
+            context.stroke(
+                path,
+                with: .linearGradient(
+                    Gradient(colors: style.colors),
+                    startPoint: CGPoint(x: 0, y: 0),
+                    endPoint: CGPoint(x: w, y: 0)
+                ),
+                lineWidth: 2 + blur
+            )
         }
     }
 }
@@ -1297,6 +1454,7 @@ struct AudioWaveformView: View {
 // MARK: - Progress Bar
 
 struct ProgressBarView: View {
+    @Environment(\.uiScale) private var zoom
     var position: Double
     var duration: Double
     var accentColor: Color = .white
@@ -1314,35 +1472,35 @@ struct ProgressBarView: View {
     }
 
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 2 * zoom) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     // Track background
-                    RoundedRectangle(cornerRadius: 2)
+                    RoundedRectangle(cornerRadius: 2 * zoom)
                         .fill(Color.white.opacity(0.15))
-                        .frame(height: 4)
+                        .frame(height: 4 * zoom)
 
                     // Progress fill
-                    RoundedRectangle(cornerRadius: 2)
+                    RoundedRectangle(cornerRadius: 2 * zoom)
                         .fill(accentColor)
-                        .frame(width: geo.size.width * progress, height: 4)
+                        .frame(width: geo.size.width * progress, height: 4 * zoom)
 
                     // Scrubber dot
                     Circle()
                         .fill(accentColor)
-                        .frame(width: 8, height: 8)
-                        .offset(x: max(0, geo.size.width * progress - 4))
+                        .frame(width: 8 * zoom, height: 8 * zoom)
+                        .offset(x: max(0, geo.size.width * progress - 4 * zoom))
                 }
             }
-            .frame(height: 8)
+            .frame(height: 8 * zoom)
 
             HStack {
                 Text(formatTime(position))
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .font(.system(size: 9 * zoom, weight: .medium, design: .monospaced))
                     .foregroundColor(.secondary)
                 Spacer()
                 Text("-\(formatTime(max(0, duration - position)))")
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .font(.system(size: 9 * zoom, weight: .medium, design: .monospaced))
                     .foregroundColor(.secondary)
             }
         }
@@ -1350,24 +1508,25 @@ struct ProgressBarView: View {
 }
 
 struct VolumeSliderView: View {
+    @Environment(\.uiScale) private var zoom
     @Binding var volume: Double
     var accentColor: Color = .white
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 6 * zoom) {
             Image(systemName: "speaker.fill")
-                .font(.system(size: 9))
+                .font(.system(size: 9 * zoom))
                 .foregroundColor(accentColor.opacity(0.6))
 
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2)
+                    RoundedRectangle(cornerRadius: 2 * zoom)
                         .fill(accentColor.opacity(0.15))
-                        .frame(height: 4)
+                        .frame(height: 4 * zoom)
 
-                    RoundedRectangle(cornerRadius: 2)
+                    RoundedRectangle(cornerRadius: 2 * zoom)
                         .fill(accentColor.opacity(0.6))
-                        .frame(width: geo.size.width * volume / 100, height: 4)
+                        .frame(width: geo.size.width * volume / 100, height: 4 * zoom)
                 }
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
@@ -1380,10 +1539,10 @@ struct VolumeSliderView: View {
                         }
                 )
             }
-            .frame(height: 16)
+            .frame(height: 16 * zoom)
 
             Image(systemName: "speaker.wave.3.fill")
-                .font(.system(size: 9))
+                .font(.system(size: 9 * zoom))
                 .foregroundColor(accentColor.opacity(0.6))
         }
     }
@@ -1395,6 +1554,7 @@ struct VolumeSliderView: View {
 
 struct PlaylistTrack: Identifiable, Equatable {
     let id: Int
+    let dbID: String  // Apple Music database ID for reliable playback
     let name: String
     let artist: String
     let duration: String
@@ -1484,6 +1644,7 @@ struct PlaylistTheme {
 }
 
 struct PlaylistScrollerView: View {
+    @Environment(\.uiScale) private var zoom
     @Binding var isShowing: Bool
     @Binding var currentPlaylist: String
     @Binding var currentTrack: String
@@ -1500,43 +1661,51 @@ struct PlaylistScrollerView: View {
             trackListView
             plBottomBar
         }
-        .frame(width: 300)
+        .frame(width: 300 * zoom)
         .background(theme.bg)
-        .border(theme.border, width: 1)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .border(theme.border, width: 1 * zoom)
+        .clipShape(RoundedRectangle(cornerRadius: 4 * zoom))
         .onAppear { loadTracks() }
-        .onChange(of: currentTrack) { _ in loadTracks() }
+        .onChange(of: currentTrack) { newTrack in
+            // Just update the highlight, don't re-fetch the entire playlist
+            for i in tracks.indices {
+                let isNowPlaying = tracks[i].name == newTrack
+                if tracks[i].isPlaying != isNowPlaying {
+                    tracks[i] = PlaylistTrack(id: tracks[i].id, dbID: tracks[i].dbID, name: tracks[i].name, artist: tracks[i].artist, duration: tracks[i].duration, isPlaying: isNowPlaying)
+                }
+            }
+        }
     }
 
     var plTitleBar: some View {
         let titleText = currentPlaylist.isEmpty ? "Playlist" : currentPlaylist
         return HStack {
             Image(systemName: "list.bullet")
-                .font(.system(size: 8))
+                .font(.system(size: 8 * zoom))
                 .foregroundColor(titleBarFg)
             Text(theme.isUppercased ? titleText.uppercased() : titleText)
-                .font(.system(size: 9, weight: .bold, design: theme.isMonospaced ? .monospaced : .default))
+                .font(.system(size: 9 * zoom, weight: .bold, design: theme.isMonospaced ? .monospaced : .default))
                 .foregroundColor(titleBarFg)
                 .lineLimit(1)
             Text("[\(tracks.count) tracks]")
-                .font(.system(size: 8, design: theme.isMonospaced ? .monospaced : .default))
+                .font(.system(size: 8 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                 .foregroundColor(titleBarFg.opacity(0.6))
             Spacer()
             Button(action: { loadTracks() }) {
                 Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 8))
+                    .font(.system(size: 8 * zoom))
                     .foregroundColor(titleBarFg.opacity(0.7))
             }.buttonStyle(PlainButtonStyle())
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.2)) { isShowing = false }
             }) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 8))
+                    .font(.system(size: 8 * zoom))
                     .foregroundColor(titleBarFg.opacity(0.7))
             }.buttonStyle(PlainButtonStyle())
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 5 * zoom)
         .background(
             LinearGradient(
                 colors: [theme.titleBg1, theme.titleBg2],
@@ -1553,9 +1722,9 @@ struct PlaylistScrollerView: View {
             if isLoading {
                 VStack {
                     ProgressView()
-                        .scaleEffect(0.6)
+                        .scaleEffect(0.6 * zoom)
                     Text(theme.isUppercased ? "LOADING..." : "Loading...")
-                        .font(.system(size: 8, design: theme.isMonospaced ? .monospaced : .default))
+                        .font(.system(size: 8 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                         .foregroundColor(theme.primary.opacity(0.5))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1563,7 +1732,7 @@ struct PlaylistScrollerView: View {
             } else if tracks.isEmpty {
                 VStack {
                     Text(theme.isUppercased ? "NO TRACKS" : "No tracks")
-                        .font(.system(size: 10, design: theme.isMonospaced ? .monospaced : .default))
+                        .font(.system(size: 10 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                         .foregroundColor(theme.primary.opacity(0.4))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1590,23 +1759,23 @@ struct PlaylistScrollerView: View {
 
     func trackRow(_ track: PlaylistTrack) -> some View {
         let trackText = "\(track.artist) - \(track.name)"
-        return HStack(spacing: 6) {
+        return HStack(spacing: 6 * zoom) {
             Text(String(format: "%02d", track.id + 1))
-                .font(.system(size: 8, design: theme.isMonospaced ? .monospaced : .default))
+                .font(.system(size: 8 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                 .foregroundColor(track.isPlaying ? theme.secondary : theme.primary.opacity(0.35))
-                .frame(width: 18, alignment: .trailing)
+                .frame(width: 18 * zoom, alignment: .trailing)
 
             if track.isPlaying {
                 Image(systemName: "play.fill")
-                    .font(.system(size: 6))
+                    .font(.system(size: 6 * zoom))
                     .foregroundColor(theme.primary)
-                    .frame(width: 10)
+                    .frame(width: 10 * zoom)
             } else {
-                Color.clear.frame(width: 10, height: 1)
+                Color.clear.frame(width: 10 * zoom, height: 1 * zoom)
             }
 
             Text(theme.isUppercased ? trackText.uppercased() : trackText)
-                .font(.system(size: 9, design: theme.isMonospaced ? .monospaced : .default))
+                .font(.system(size: 9 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                 .foregroundColor(track.isPlaying ? theme.primary : theme.primary.opacity(0.7))
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -1614,15 +1783,15 @@ struct PlaylistScrollerView: View {
             Spacer()
 
             Text(track.duration)
-                .font(.system(size: 8, design: theme.isMonospaced ? .monospaced : .default))
+                .font(.system(size: 8 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                 .foregroundColor(track.isPlaying ? theme.secondary : theme.primary.opacity(0.35))
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 3 * zoom)
         .background(track.isPlaying ? theme.activeBg : (track.id % 2 == 0 ? theme.rowBg1 : theme.rowBg2))
         .contentShape(Rectangle())
         .onTapGesture {
-            MusicController.playTrackAtIndex(track.id) { success in
+            MusicController.playTrackByDatabaseID(track.dbID, playlistPersistentID: MusicController.currentPlaylistPersistentID) { success in
                 if success {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                         loadTracks()
@@ -1638,21 +1807,21 @@ struct PlaylistScrollerView: View {
             if let playing = tracks.first(where: { $0.isPlaying }) {
                 let t = theme.isUppercased ? "▶ \(playing.name.uppercased())" : "▶ \(playing.name)"
                 Text(t)
-                    .font(.system(size: 7, design: theme.isMonospaced ? .monospaced : .default))
+                    .font(.system(size: 7 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                     .foregroundColor(theme.primary.opacity(0.6))
                     .lineLimit(1)
             } else {
                 Text(theme.isUppercased ? "STOPPED" : "Stopped")
-                    .font(.system(size: 7, design: theme.isMonospaced ? .monospaced : .default))
+                    .font(.system(size: 7 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                     .foregroundColor(theme.primary.opacity(0.4))
             }
             Spacer()
             Text(totalTimeString)
-                .font(.system(size: 7, design: theme.isMonospaced ? .monospaced : .default))
+                .font(.system(size: 7 * zoom, design: theme.isMonospaced ? .monospaced : .default))
                 .foregroundColor(theme.secondary.opacity(0.6))
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 4 * zoom)
         .background(theme.bottomBg)
     }
 
@@ -1669,7 +1838,7 @@ struct PlaylistScrollerView: View {
     private func loadTracks() {
         isLoading = true
         MusicController.fetchCurrentPlaylistTracks { result in
-            tracks = result.enumerated().map { PlaylistTrack(id: $0.offset, name: $0.element.name, artist: $0.element.artist, duration: $0.element.duration, isPlaying: $0.element.isPlaying) }
+            tracks = result.enumerated().map { PlaylistTrack(id: $0.offset, dbID: $0.element.dbID, name: $0.element.name, artist: $0.element.artist, duration: $0.element.duration, isPlaying: $0.element.isPlaying) }
             isLoading = false
         }
     }
@@ -1678,8 +1847,8 @@ struct PlaylistScrollerView: View {
 // MARK: - Winamp Skin View
 
 struct WinampView: View {
+    @Environment(\.uiScale) private var zoom
     @ObservedObject var buttonStore: ButtonStore
-    @ObservedObject var waveformEngine: WaveformEngine
     @Binding var currentTrack: String
     @Binding var currentArtist: String
     @Binding var currentPlaylist: String
@@ -1710,9 +1879,6 @@ struct WinampView: View {
     private let winBorder = Color(red: 0.25, green: 0.25, blue: 0.3)
     private let winHighlight = Color(red: 0.2, green: 0.2, blue: 0.25)
 
-    @State private var scrollOffset: CGFloat = 0
-    @State private var tickerTimer: Timer?
-
     var body: some View {
         VStack(spacing: 0) {
             // Title bar
@@ -1733,51 +1899,64 @@ struct WinampView: View {
             // Status bar
             statusBar
         }
-        .frame(width: 300)
+        .frame(width: 300 * zoom)
         .background(winDarkBg)
-        .border(winBorder, width: 1)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
-        .shadow(color: .black.opacity(0.5), radius: 10, x: 0, y: 4)
+        .border(winBorder, width: 1 * zoom)
+        .clipShape(RoundedRectangle(cornerRadius: 4 * zoom))
+        // Shadow lives on a static backing shape, not the content, so redraws
+        // inside the player don't force the whole view through a shadow pass.
+        .background(
+            RoundedRectangle(cornerRadius: 4 * zoom)
+                .fill(winDarkBg)
+                .shadow(color: .black.opacity(0.5), radius: 10 * zoom, x: 0, y: 4 * zoom)
+        )
     }
 
     var titleBar: some View {
         HStack(spacing: 0) {
             // Winamp logo area — also serves as drag handle
-            HStack(spacing: 4) {
+            HStack(spacing: 4 * zoom) {
                 Image("WinampLogo")
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(height: 14)
+                    .frame(height: 14 * zoom)
                 Text("ZENAMP")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .font(.system(size: 9 * zoom, weight: .bold, design: .monospaced))
                     .foregroundColor(winGreen)
                 Text("v1.0")
-                    .font(.system(size: 7, design: .monospaced))
+                    .font(.system(size: 7 * zoom, design: .monospaced))
                     .foregroundColor(winGreen.opacity(0.5))
                 Spacer()
             }
             
-            HStack(spacing: 6) {
-                AudioOutputMenuButton(size: 8, color: NSColor(winGreen.opacity(0.6)))
-                    .frame(width: 20, height: 20)
+            HStack(spacing: 6 * zoom) {
+                AudioOutputMenuButton(size: 8 * zoom, color: NSColor(winGreen.opacity(0.6)))
+                    .frame(width: 20 * zoom, height: 20 * zoom)
+                AppKitButton(
+                    icon: AppState.shared.zoomLevel == 1.0 ? "plus.magnifyingglass" : (AppState.shared.zoomLevel == 1.5 ? "1.magnifyingglass" : "minus.magnifyingglass"),
+                    size: 8 * zoom,
+                    color: NSColor(winGreen.opacity(0.6)),
+                    action: { AppState.shared.cycleZoom(); resizeWindow() }
+                )
+                .frame(width: 20 * zoom, height: 20 * zoom)
                 AppKitButton(
                     icon: AppState.shared.visualizerMode.icon,
-                    size: 8,
+                    size: 8 * zoom,
                     color: NSColor(winGreen.opacity(0.6)),
                     action: { AppState.shared.cycleVisualizer() }
                 )
-                .frame(width: 20, height: 20)
+                .frame(width: 20 * zoom, height: 20 * zoom)
                 AppKitButton(
                     icon: "gearshape.fill",
-                    size: 8,
+                    size: 8 * zoom,
                     color: NSColor(winGreen.opacity(0.6)),
                     action: { [self] in withAnimation(.easeInOut(duration: 0.2)) { showSettings = true } }
                 )
-                .frame(width: 20, height: 20)
+                .frame(width: 20 * zoom, height: 20 * zoom)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 5 * zoom)
         .background(
             LinearGradient(
                 colors: [Color(red: 0.05, green: 0.05, blue: 0.08), Color(red: 0.12, green: 0.12, blue: 0.15)],
@@ -1788,54 +1967,54 @@ struct WinampView: View {
     }
 
     var displayArea: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 6 * zoom) {
             // Album art + track info side by side
-            HStack(spacing: 10) {
+            HStack(spacing: 10 * zoom) {
                 // Small album art — click to expand
                 ZStack {
-                    RoundedRectangle(cornerRadius: 2)
+                    RoundedRectangle(cornerRadius: 2 * zoom)
                         .fill(Color.black)
-                        .frame(width: 64, height: 64)
+                        .frame(width: 64 * zoom, height: 64 * zoom)
 
                     if let art = albumArt {
                         Image(nsImage: art)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
-                            .frame(width: 62, height: 62)
+                            .frame(width: 62 * zoom, height: 62 * zoom)
                             .clipped()
-                            .clipShape(RoundedRectangle(cornerRadius: 1))
+                            .clipShape(RoundedRectangle(cornerRadius: 1 * zoom))
                     } else {
                         Image(systemName: "music.note")
-                            .font(.system(size: 20))
+                            .font(.system(size: 20 * zoom))
                             .foregroundColor(winGreen.opacity(0.3))
                     }
                 }
                 .overlay(
-                    RoundedRectangle(cornerRadius: 2)
-                        .stroke(winGreen.opacity(0.3), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 2 * zoom)
+                        .stroke(winGreen.opacity(0.3), lineWidth: 1 * zoom)
                 )
 
                 // Track info
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 4 * zoom) {
                     // Scrolling track name
                     Text(currentTrack.isEmpty ? "- NO TRACK -" : currentTrack.uppercased())
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .font(.system(size: 12 * zoom, weight: .bold, design: .monospaced))
                         .foregroundColor(winGreen)
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
                     Text(currentArtist.isEmpty ? "" : currentArtist.uppercased())
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 9 * zoom, design: .monospaced))
                         .foregroundColor(winAmber)
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
                     // Playlist indicator
-                    HStack(spacing: 4) {
+                    HStack(spacing: 4 * zoom) {
                         Image(systemName: "list.bullet")
-                            .font(.system(size: 7))
+                            .font(.system(size: 7 * zoom))
                             .foregroundColor(winGreen.opacity(0.5))
                         Menu {
                             ForEach(playlists, id: \.self) { name in
@@ -1860,7 +2039,7 @@ struct WinampView: View {
                             }
                         } label: {
                             Text(currentPlaylist.isEmpty ? "NO PLAYLIST" : currentPlaylist.uppercased())
-                                .font(.system(size: 8, design: .monospaced))
+                                .font(.system(size: 8 * zoom, design: .monospaced))
                                 .foregroundColor(winGreen.opacity(0.6))
                                 .lineLimit(1)
                                 .truncationMode(.tail)
@@ -1869,53 +2048,53 @@ struct WinampView: View {
                     }
 
                     // Status
-                    HStack(spacing: 6) {
+                    HStack(spacing: 6 * zoom) {
                         Circle()
                             .fill(isPlaying ? winGreen : Color.red)
-                            .frame(width: 5, height: 5)
+                            .frame(width: 5 * zoom, height: 5 * zoom)
                         Text(isPlaying ? "PLAYING" : "PAUSED")
-                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .font(.system(size: 8 * zoom, weight: .medium, design: .monospaced))
                             .foregroundColor(isPlaying ? winGreen.opacity(0.7) : Color.red.opacity(0.7))
 
                         Spacer()
 
                         Text(shuffleEnabled ? "SHUF" : "")
-                            .font(.system(size: 7, weight: .bold, design: .monospaced))
+                            .font(.system(size: 7 * zoom, weight: .bold, design: .monospaced))
                             .foregroundColor(winAmber.opacity(0.6))
                     }
                 }
             }
         }
-        .padding(10)
+        .padding(10 * zoom)
         .background(
-            RoundedRectangle(cornerRadius: 3)
+            RoundedRectangle(cornerRadius: 3 * zoom)
                 .fill(Color.black.opacity(0.6))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 3)
-                .stroke(winGreen.opacity(0.15), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 3 * zoom)
+                .stroke(winGreen.opacity(0.15), lineWidth: 1 * zoom)
         )
-        .padding(.horizontal, 6)
-        .padding(.top, 4)
+        .padding(.horizontal, 6 * zoom)
+        .padding(.top, 4 * zoom)
     }
 
     var eqBars: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 4 * zoom) {
             if let style = AppState.shared.visualizerMode.style {
-                AudioWaveformView(engine: waveformEngine, isPlaying: isPlaying, style: style)
-                    .frame(height: 18)
+                AudioWaveformView(isPlaying: isPlaying && AppState.shared.isWindowVisible, style: style)
+                    .frame(height: 18 * zoom)
             }
 
             ProgressBarView(position: playerPosition, duration: trackDuration, accentColor: winGreen)
 
             VolumeSliderView(volume: $volume, accentColor: winGreen)
-                .frame(height: 12)
+                .frame(height: 12 * zoom)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 10 * zoom)
+        .padding(.vertical, 6 * zoom)
         .background(Color.black.opacity(0.4))
-        .padding(.horizontal, 6)
-        .padding(.top, 4)
+        .padding(.horizontal, 6 * zoom)
+        .padding(.top, 4 * zoom)
     }
 
     var transportControls: some View {
@@ -1957,35 +2136,35 @@ struct WinampView: View {
                 resizeWindow()
             }
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 6 * zoom)
+        .padding(.vertical, 4 * zoom)
     }
 
     func winampButton(icon: String, label: String, highlight: Bool = false, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(spacing: 2) {
+            VStack(spacing: 2 * zoom) {
                 Image(systemName: icon)
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: 11 * zoom, weight: .bold))
                 Text(label)
-                    .font(.system(size: 6, weight: .bold, design: .monospaced))
+                    .font(.system(size: 6 * zoom, weight: .bold, design: .monospaced))
             }
             .foregroundColor(active ? winAmber : (highlight ? winGreen : winGreen.opacity(0.7)))
-            .frame(width: 42, height: 32)
+            .frame(width: 42 * zoom, height: 32 * zoom)
             .background(
-                RoundedRectangle(cornerRadius: 3)
+                RoundedRectangle(cornerRadius: 3 * zoom)
                     .fill(winMidBg)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 3)
-                            .stroke(active ? winAmber.opacity(0.5) : winBorder, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 3 * zoom)
+                            .stroke(active ? winAmber.opacity(0.5) : winBorder, lineWidth: 1 * zoom)
                     )
             )
         }
         .buttonStyle(PlainButtonStyle())
-        .padding(.horizontal, 2)
+        .padding(.horizontal, 2 * zoom)
     }
 
     var actionButtons: some View {
-        VStack(spacing: 3) {
+        VStack(spacing: 3 * zoom) {
             ForEach(buttonStore.buttons) { config in
                 Button(action: {
                     if config.isFavorite {
@@ -2002,72 +2181,72 @@ struct WinampView: View {
                         }
                     }
                 }) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 8 * zoom) {
                         Image(systemName: config.icon)
-                            .font(.system(size: 10, weight: .bold))
+                            .font(.system(size: 10 * zoom, weight: .bold))
                             .foregroundColor(winGreen)
-                            .frame(width: 16)
+                            .frame(width: 16 * zoom)
 
                         Text(config.title.uppercased())
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .font(.system(size: 9 * zoom, weight: .bold, design: .monospaced))
                             .foregroundColor(winGreen.opacity(0.9))
 
                         Spacer()
 
                         if isLoading[config.id] == true {
                             ProgressView()
-                                .scaleEffect(0.4)
+                                .scaleEffect(0.4 * zoom)
                         } else {
                             Text(config.isFavorite ? "FAV" : "ADD")
-                                .font(.system(size: 7, weight: .bold, design: .monospaced))
+                                .font(.system(size: 7 * zoom, weight: .bold, design: .monospaced))
                                 .foregroundColor(winAmber.opacity(0.6))
                         }
 
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 7))
+                            .font(.system(size: 7 * zoom))
                             .foregroundColor(winGreen.opacity(0.3))
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+                    .padding(.horizontal, 10 * zoom)
+                    .padding(.vertical, 6 * zoom)
                     .background(
-                        RoundedRectangle(cornerRadius: 2)
+                        RoundedRectangle(cornerRadius: 2 * zoom)
                             .fill(winMidBg)
                             .overlay(
-                                RoundedRectangle(cornerRadius: 2)
-                                    .stroke(winGreen.opacity(0.1), lineWidth: 1)
+                                RoundedRectangle(cornerRadius: 2 * zoom)
+                                    .stroke(winGreen.opacity(0.1), lineWidth: 1 * zoom)
                             )
                     )
                 }
                 .buttonStyle(PlainButtonStyle())
             }
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 6 * zoom)
+        .padding(.vertical, 4 * zoom)
     }
 
     var statusBar: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 4 * zoom) {
             if showBanner {
                 Image(systemName: bannerType.icon)
-                    .font(.system(size: 7))
+                    .font(.system(size: 7 * zoom))
                     .foregroundColor(bannerType == .success ? winGreen : (bannerType == .error ? Color.red : winAmber))
                 Text(bannerMessage.uppercased())
-                    .font(.system(size: 7, design: .monospaced))
+                    .font(.system(size: 7 * zoom, design: .monospaced))
                     .foregroundColor(bannerType == .success ? winGreen : (bannerType == .error ? Color.red : winAmber))
                     .lineLimit(1)
                     .truncationMode(.tail)
             } else {
                 Text("READY")
-                    .font(.system(size: 7, design: .monospaced))
+                    .font(.system(size: 7 * zoom, design: .monospaced))
                     .foregroundColor(winGreen.opacity(0.4))
             }
             Spacer()
             Text("♫")
-                .font(.system(size: 8))
+                .font(.system(size: 8 * zoom))
                 .foregroundColor(winGreen.opacity(0.3))
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 4 * zoom)
         .background(Color.black.opacity(0.3))
     }
 }
@@ -2122,6 +2301,7 @@ struct AppPrefs: Codable {
     var visualizerMode: String = VisualizerMode.bars.rawValue
     var showExpandedArt: Bool = false
     var showPlaylist: Bool = false
+    var zoomLevel: Double = 1.5
 }
 
 class AppState: ObservableObject {
@@ -2129,6 +2309,9 @@ class AppState: ObservableObject {
     @Published var visualizerMode: VisualizerMode = .bars { didSet { savePrefs() } }
     @Published var showExpandedArt: Bool = false { didSet { savePrefs() } }
     @Published var showPlaylist: Bool = false { didSet { savePrefs() } }
+    @Published var zoomLevel: Double = 1.5 { didSet { savePrefs() } }
+    /// False when the window is fully covered, hidden, or on another Space.
+    @Published var isWindowVisible: Bool = true
 
     private var suppressSave = true
 
@@ -2145,6 +2328,7 @@ class AppState: ObservableObject {
             self.visualizerMode = VisualizerMode(rawValue: prefs.visualizerMode) ?? .bars
             self.showExpandedArt = prefs.showExpandedArt
             self.showPlaylist = prefs.showPlaylist
+            self.zoomLevel = prefs.zoomLevel
         }
         suppressSave = false
     }
@@ -2154,7 +2338,8 @@ class AppState: ObservableObject {
         let prefs = AppPrefs(
             visualizerMode: visualizerMode.rawValue,
             showExpandedArt: showExpandedArt,
-            showPlaylist: showPlaylist
+            showPlaylist: showPlaylist,
+            zoomLevel: zoomLevel
         )
         if let data = try? JSONEncoder().encode(prefs) {
             try? data.write(to: AppState.prefsURL)
@@ -2163,6 +2348,15 @@ class AppState: ObservableObject {
 
     func cycleVisualizer() {
         visualizerMode = visualizerMode.next()
+    }
+
+    func cycleZoom() {
+        let levels = [1.0, 1.5, 2.0]
+        if let idx = levels.firstIndex(of: zoomLevel) {
+            zoomLevel = levels[(idx + 1) % levels.count]
+        } else {
+            zoomLevel = 1.0
+        }
     }
 }
 
@@ -2184,17 +2378,23 @@ struct ZenAmpLauncher {
     }
 }
 
+class BorderlessKeyWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static var shared: AppDelegate?
     var mainWindow: NSWindow?
 
     private let windowXKey = "windowPositionX"
     private let windowYKey = "windowPositionY"
+    private var dragMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
 
-        let window = NSWindow(
+        let window = BorderlessKeyWindow(
             contentRect: NSRect(x: 0, y: 0, width: 300, height: 520),
             styleMask: [.borderless, .fullSizeContentView],
             backing: .buffered,
@@ -2207,15 +2407,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.level = .floating
         window.backgroundColor = .clear
         window.isOpaque = false
+        // The player draws its own drop shadow; the system one would trace an
+        // outline around that shadow's faded edge on this transparent window.
+        window.hasShadow = false
         window.isRestorable = false
+        window.restorationClass = nil
         window.delegate = self
         window.contentViewController = NSHostingController(rootView: ContentView())
 
-        // Restore saved position or center
+        // Restore saved position, but only if it still lands on a connected display.
+        // Display arrangements change, and a borderless window stranded off-screen
+        // has no title bar or Window menu the user could recover it with.
         if UserDefaults.standard.object(forKey: windowXKey) != nil {
             let x = UserDefaults.standard.double(forKey: windowXKey)
             let y = UserDefaults.standard.double(forKey: windowYKey)
-            window.setFrameOrigin(NSPoint(x: x, y: y))
+            var restored = window.frame
+            restored.origin = NSPoint(x: x, y: y)
+            if AppDelegate.isGrabbable(restored) {
+                window.setFrameOrigin(restored.origin)
+            } else {
+                window.center()
+            }
         } else {
             window.center()
         }
@@ -2224,10 +2436,85 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         mainWindow = window
+
+        installTitleBarDragMonitor()
+
+        // Unplugging a display can strand the window just as badly as a stale
+        // saved position — pull it back into view when the arrangement changes.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+    }
+
+    /// Makes the title bar drag the window.
+    ///
+    /// `isMovableByWindowBackground` never fires because NSHostingView consumes
+    /// mouse-down across the whole SwiftUI surface. A local event monitor
+    /// sidesteps that — it reads raw window coordinates before the event is
+    /// ever dispatched into the view hierarchy.
+    private func installTitleBarDragMonitor() {
+        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self,
+                  let window = self.mainWindow,
+                  event.window === window,
+                  self.isInTitleBarDragZone(event, in: window)
+            else { return event }
+
+            window.performDrag(with: event)
+            return nil  // swallow it; the drag loop owns this event now
+        }
+    }
+
+    /// The title bar strip, minus the right-hand cluster of control buttons.
+    /// Measured in window points, which already include the zoom scale.
+    private func isInTitleBarDragZone(_ event: NSEvent, in window: NSWindow) -> Bool {
+        let zoom = CGFloat(AppState.shared.zoomLevel)
+        let titleBarHeight: CGFloat = 30 * zoom
+        let controlClusterWidth: CGFloat = 115 * zoom
+
+        let point = event.locationInWindow          // bottom-left origin
+        let distanceFromTop = window.frame.height - point.y
+
+        return distanceFromTop >= 0
+            && distanceFromTop <= titleBarHeight
+            && point.x <= window.frame.width - controlClusterWidth
+    }
+
+    @objc private func screenParametersChanged() {
+        guard let window = mainWindow, !AppDelegate.isGrabbable(window.frame) else { return }
+        window.center()
+        saveWindowPosition()
+    }
+
+    /// True when enough of the window's drag handle sits on a connected screen
+    /// for the user to actually grab it.
+    private static func isGrabbable(_ frame: NSRect) -> Bool {
+        let handleHeight: CGFloat = 30
+        let handle = NSRect(
+            x: frame.minX,
+            y: frame.maxY - handleHeight,
+            width: frame.width,
+            height: handleHeight
+        )
+        return NSScreen.screens.contains { screen in
+            let overlap = screen.visibleFrame.intersection(handle)
+            return overlap.width >= 100 && overlap.height >= 20
+        }
     }
 
     func windowDidMove(_ notification: Notification) {
         saveWindowPosition()
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard let window = mainWindow else { return }
+        let visible = window.occlusionState.contains(.visible)
+        if AppState.shared.isWindowVisible != visible {
+            AppState.shared.isWindowVisible = visible
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
