@@ -214,7 +214,7 @@ class MusicController {
 
     private static let scriptTimeout: TimeInterval = 30
 
-    static func runAppleScript(_ script: String, completion: @escaping (Bool, String) -> Void) {
+    static func runAppleScript(_ script: String, timeout: TimeInterval = scriptTimeout, completion: @escaping (Bool, String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             autoreleasepool {
                 let process = Process()
@@ -234,7 +234,7 @@ class MusicController {
 
                     // If Music is blocked (modal dialog, sync) the Apple Event can sit
                     // for minutes — kill the script so callers always get a completion.
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + scriptTimeout) {
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
                         if process.isRunning { process.terminate() }
                     }
 
@@ -303,11 +303,16 @@ class MusicController {
                 set isPlaying to (player state is playing)
                 set playlistName to ""
                 try
-                    set currentSource to container of current track
-                    if class of currentSource is user playlist then
-                        set playlistName to name of currentSource
-                    end if
+                    set playlistName to name of current playlist
                 end try
+                if playlistName is "" then
+                    try
+                        set currentSource to container of current track
+                        if class of currentSource is user playlist then
+                            set playlistName to name of currentSource
+                        end if
+                    end try
+                end if
         \(pidClause)
                 set pos to 0
                 set dur to 0
@@ -435,40 +440,59 @@ class MusicController {
         }
     }
 
-    /// Stores the persistent ID of the playlist we last fetched, so playTrackAtIndex uses the same source
+    /// Persistent ID of the playlist the track list was last fetched from, so a click
+    /// in the list plays from that same playlist.
     static var currentPlaylistPersistentID: String?
 
+    /// True while `jumpToTrack` is skipping through a playlist; each skip posts a
+    /// player-info notification that shouldn't trigger a refresh.
+    static var isJumping = false
+
     static func fetchCurrentPlaylistTracks(completion: @escaping ([(name: String, artist: String, duration: String, isPlaying: Bool, dbID: String)]) -> Void) {
-        // If we already know a playlist persistent ID, fetch from that playlist directly
-        // instead of relying on 'container of current track' which loses the playlist link
-        let srcSetup: String
+        // Source, in order of preference: the playlist Music is playing from, the one
+        // we last showed, then the current track's container. Music's `current playlist`
+        // also works for sources (catalog playlists, albums) whose container doesn't.
+        let lastPlaylistClause: String
         if let pid = currentPlaylistPersistentID {
-            srcSetup = """
-                set src to first playlist whose persistent ID is "\(pid)"
-                set srcID to "playlist:" & (persistent ID of src)
-            """
-        } else {
-            srcSetup = """
-                set src to container of current track
-                set srcClass to class of src
-                set srcID to ""
-                if srcClass is playlist then
-                    set srcID to "playlist:" & (persistent ID of src)
+            lastPlaylistClause = """
+                if src is missing value then
+                    try
+                        set src to first playlist whose persistent ID is "\(pid)"
+                    end try
                 end if
             """
+        } else {
+            lastPlaylistClause = ""
         }
         let script = """
+        if application "Music" is not running then
+            return ""
+        end if
         tell application "Music"
             set currentName to ""
             set currentArtist to ""
-            try
-                if player state is playing or player state is paused then
+            set src to missing value
+            if player state is playing or player state is paused then
+                try
                     set currentName to name of current track
                     set currentArtist to artist of current track
-                end if
+                end try
+                try
+                    set src to current playlist
+                end try
+            end if
+            \(lastPlaylistClause)
+            if src is missing value then
+                try
+                    set src to container of current track
+                end try
+            end if
+            if src is missing value then return ""
+            set srcID to ""
+            try
+                set srcID to "playlist:" & (persistent ID of src)
             end try
             try
-                \(srcSetup)
                 set allNames to name of tracks of src
                 set allArtists to artist of tracks of src
                 set allDurs to duration of tracks of src
@@ -506,10 +530,9 @@ class MusicController {
                 // First element is the source ID
                 if let first = lines.first {
                     lines.removeFirst()
-                    if first.hasPrefix("playlist:") {
-                        currentPlaylistPersistentID = String(first.dropFirst("playlist:".count))
-                    } else if currentPlaylistPersistentID == nil {
-                        // Only clear if we didn't already have one — don't lose it
+                    let pid = first.dropFirst("playlist:".count)
+                    if first.hasPrefix("playlist:") && !pid.isEmpty {
+                        currentPlaylistPersistentID = String(pid)
                     }
                 }
                 let tracks = lines.compactMap { line -> (name: String, artist: String, duration: String, isPlaying: Bool, dbID: String)? in
@@ -524,35 +547,104 @@ class MusicController {
         }
     }
 
-    static func playTrackByDatabaseID(_ dbID: String, playlistPersistentID: String?, completion: @escaping (Bool) -> Void) {
-        let script: String
-        if let pid = playlistPersistentID {
-            // Play the track within the playlist context so Music stays on the playlist
-            script = """
-            tell application "Music"
-                try
-                    set pl to first playlist whose persistent ID is "\(pid)"
-                    set t to (first track of pl whose database ID is \(dbID))
-                    play t
-                    return "ok"
-                end try
-                return "error"
-            end tell
-            """
-        } else {
-            script = """
-            tell application "Music"
-                try
-                    set src to container of current track
-                    set t to (first track of src whose database ID is \(dbID))
-                    play t
-                    return "ok"
-                end try
-                return "error"
-            end tell
-            """
+    /// Starts playback at a track and carries on through the rest of the playlist.
+    ///
+    /// Music's `play <track>` plays just that one track and then stops, even when the
+    /// track is referenced through its playlist. So instead: play the playlist (or stay
+    /// in it, if it's already playing in order) and step through it with next/previous
+    /// until the clicked track is current, muted so the skips aren't heard. Each step
+    /// waits for Music to actually change track — fired back-to-back, skips get dropped.
+    static func jumpToTrack(dbID: String, index: Int, playlistPersistentID pid: String, completion: @escaping (Bool) -> Void) {
+        // Both values are interpolated into the script.
+        guard Int(dbID) != nil, pid.allSatisfy(\.isHexDigit) else {
+            completion(false)
+            return
         }
-        runAppleScript(script) { success, _ in
+        let script = """
+        on currentID()
+            tell application "Music"
+                try
+                    return database ID of current track
+                on error
+                    return -1
+                end try
+            end tell
+        end currentID
+
+        on stepFrom(previousID, direction)
+            tell application "Music"
+                if direction is 1 then
+                    next track
+                else
+                    previous track
+                end if
+            end tell
+            repeat 50 times
+                set nowID to my currentID()
+                if nowID is not previousID and nowID is not -1 then return nowID
+                delay 0.02
+            end repeat
+            return previousID
+        end stepFrom
+
+        set targetID to \(dbID)
+        set targetIndex to \(index)
+        tell application "Music"
+            set pl to first playlist whose persistent ID is "\(pid)"
+            set oldVolume to sound volume
+            set stayInPlace to false
+            try
+                set stayInPlace to (player state is not stopped) and (persistent ID of current playlist is "\(pid)") and not shuffle enabled
+            end try
+        end tell
+        set found to false
+        try
+            tell application "Music"
+                set sound volume to 0
+                if not stayInPlace then play pl
+            end tell
+            set curID to -1
+            repeat 50 times
+                set curID to my currentID()
+                if curID is not -1 then exit repeat
+                delay 0.02
+            end repeat
+            set direction to 1
+            if stayInPlace then
+                tell application "Music"
+                    if targetIndex < (index of current track) then
+                        set direction to -1
+                        -- so 'previous track' moves back rather than restarting this one
+                        set player position to 0
+                    end if
+                end tell
+            end if
+            set steps to 0
+            repeat while curID is not targetID and steps < 250
+                set nextID to my stepFrom(curID, direction)
+                if nextID is curID then exit repeat
+                set curID to nextID
+                set steps to steps + 1
+            end repeat
+            set found to (curID is targetID)
+            tell application "Music"
+                if found then
+                    set player position to 0
+                    play
+                else
+                    -- Couldn't reach it by stepping; at least play the track itself.
+                    play (first track of pl whose database ID is targetID)
+                end if
+            end tell
+        end try
+        tell application "Music" to set sound volume to oldVolume
+        if found then return "ok"
+        return "fallback"
+        """
+        isJumping = true
+        // 250 steps at ~0.3s each, plus headroom; killing it mid-way would leave Music muted.
+        runAppleScript(script, timeout: 120) { success, _ in
+            isJumping = false
             completion(success)
         }
     }
@@ -1137,6 +1229,7 @@ struct ContentView: View {
             MusicController.getVolume { v in volume = v }
         }
         .onReceive(playerInfoChanged) { _ in
+            guard !MusicController.isJumping else { return }
             refreshTrackInfo()
         }
         .onReceive(timer) { _ in
@@ -1650,6 +1743,7 @@ struct PlaylistScrollerView: View {
     @Binding var currentTrack: String
     @State private var tracks: [PlaylistTrack] = []
     @State private var isLoading = true
+    @State private var jumpingToTrackID: Int?
     var refreshTrackInfo: () -> Void
     @ObservedObject var appState = AppState.shared
 
@@ -1666,6 +1760,10 @@ struct PlaylistScrollerView: View {
         .border(theme.border, width: 1 * zoom)
         .clipShape(RoundedRectangle(cornerRadius: 4 * zoom))
         .onAppear { loadTracks() }
+        .onChange(of: currentPlaylist) { _, _ in
+            // The list follows whatever Music is playing from.
+            if !MusicController.isJumping { loadTracks() }
+        }
         .onChange(of: currentTrack) { newTrack in
             // Just update the highlight, don't re-fetch the entire playlist
             for i in tracks.indices {
@@ -1765,7 +1863,11 @@ struct PlaylistScrollerView: View {
                 .foregroundColor(track.isPlaying ? theme.secondary : theme.primary.opacity(0.35))
                 .frame(width: 18 * zoom, alignment: .trailing)
 
-            if track.isPlaying {
+            if jumpingToTrackID == track.id {
+                ProgressView()
+                    .scaleEffect(0.3 * zoom)
+                    .frame(width: 10 * zoom, height: 10 * zoom)
+            } else if track.isPlaying {
                 Image(systemName: "play.fill")
                     .font(.system(size: 6 * zoom))
                     .foregroundColor(theme.primary)
@@ -1791,13 +1893,12 @@ struct PlaylistScrollerView: View {
         .background(track.isPlaying ? theme.activeBg : (track.id % 2 == 0 ? theme.rowBg1 : theme.rowBg2))
         .contentShape(Rectangle())
         .onTapGesture {
-            MusicController.playTrackByDatabaseID(track.dbID, playlistPersistentID: MusicController.currentPlaylistPersistentID) { success in
-                if success {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        loadTracks()
-                        refreshTrackInfo()
-                    }
-                }
+            guard !MusicController.isJumping,
+                  let pid = MusicController.currentPlaylistPersistentID else { return }
+            jumpingToTrackID = track.id
+            MusicController.jumpToTrack(dbID: track.dbID, index: track.id + 1, playlistPersistentID: pid) { _ in
+                jumpingToTrackID = nil
+                refreshTrackInfo()
             }
         }
     }
@@ -1838,8 +1939,11 @@ struct PlaylistScrollerView: View {
     private func loadTracks() {
         isLoading = true
         MusicController.fetchCurrentPlaylistTracks { result in
+            defer { isLoading = false }
+            // A failed fetch (Music busy, nothing playing) keeps the list we have
+            // rather than blanking it.
+            if result.isEmpty && !tracks.isEmpty { return }
             tracks = result.enumerated().map { PlaylistTrack(id: $0.offset, dbID: $0.element.dbID, name: $0.element.name, artist: $0.element.artist, duration: $0.element.duration, isPlaying: $0.element.isPlaying) }
-            isLoading = false
         }
     }
 }
