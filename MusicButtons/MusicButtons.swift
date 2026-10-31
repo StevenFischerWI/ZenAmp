@@ -741,58 +741,6 @@ class MusicController {
             }
         }
     }
-    
-    static func addCurrentTrackToPlaylist(_ playlistName: String, completion: @escaping (Bool, String) -> Void) {
-        let escapedName = playlistName.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = """
-        if application "Music" is not running then
-            return "NO_TRACK"
-        end if
-        tell application "Music"
-            if player state is playing or player state is paused then
-                set theTrack to current track
-                set trackName to name of theTrack
-                set trackArtist to artist of theTrack
-                set trackDuration to duration of theTrack
-                try
-                    set thePlaylist to user playlist "\(escapedName)"
-                    -- Check for duplicates
-                    set isDuplicate to false
-                    repeat with t in tracks of thePlaylist
-                        if name of t is trackName and artist of t is trackArtist and duration of t is trackDuration then
-                            set isDuplicate to true
-                            exit repeat
-                        end if
-                    end repeat
-                    if isDuplicate then
-                        return "DUPLICATE"
-                    end if
-                    -- Add to playlist and favorite
-                    duplicate theTrack to thePlaylist
-                    set favorited of theTrack to true
-                    return trackName
-                on error
-                    return "PLAYLIST_NOT_FOUND"
-                end try
-            else
-                return "NO_TRACK"
-            end if
-        end tell
-        """
-        runAppleScript(script) { success, result in
-            if success && result == "DUPLICATE" {
-                completion(false, "Already in \(playlistName)")
-            } else if success && result != "NO_TRACK" && result != "PLAYLIST_NOT_FOUND" {
-                completion(true, "Added to \(playlistName): " + result)
-            } else if result == "NO_TRACK" {
-                completion(false, "No track is currently playing")
-            } else if result == "PLAYLIST_NOT_FOUND" {
-                completion(false, "Playlist \"\(playlistName)\" not found")
-            } else {
-                completion(false, result)
-            }
-        }
-    }
 }
 
 // MARK: - Status Banner
@@ -817,83 +765,11 @@ enum BannerType {
     }
 }
 
-// MARK: - Button Configuration
-
-struct ButtonConfig: Identifiable, Codable, Equatable {
-    var id: String
-    var title: String
-    var playlist: String
-    var icon: String
-    var colorName: String
-    var isFavorite: Bool  // true = favorites action, false = add to playlist
-
-    var color: Color {
-        switch colorName {
-        case "pink": return .pink
-        case "blue": return .blue
-        case "purple": return .purple
-        case "green": return .green
-        case "orange": return .orange
-        case "red": return .red
-        case "yellow": return .yellow
-        case "teal": return .teal
-        default: return .blue
-        }
-    }
-
-    static let availableColors = ["pink", "blue", "purple", "green", "orange", "red", "yellow", "teal"]
-    static let availableIcons = [
-        "heart.fill", "waveform", "bolt.fill", "star.fill", "music.note",
-        "guitars.fill", "headphones", "mic.fill", "pianokeys", "beats.headphones",
-        "flame.fill", "sparkles", "moon.fill", "sun.max.fill", "leaf.fill"
-    ]
-
-    static let defaults: [ButtonConfig] = [
-        ButtonConfig(id: "btn1", title: "Favorite", playlist: "", icon: "heart.fill", colorName: "pink", isFavorite: true),
-        ButtonConfig(id: "btn2", title: "Shazam", playlist: "My Shazam Tracks", icon: "waveform", colorName: "blue", isFavorite: false),
-        ButtonConfig(id: "btn3", title: "Electronic", playlist: "Electronic Finds", icon: "bolt.fill", colorName: "purple", isFavorite: false),
-    ]
-}
-
-class ButtonStore: ObservableObject {
-    @Published var buttons: [ButtonConfig]
-
-    private static var settingsURL: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let dir = home.appendingPathComponent(".zenamp")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("settings.json")
-    }
-
-    init() {
-        if let data = try? Data(contentsOf: ButtonStore.settingsURL),
-           let decoded = try? JSONDecoder().decode([ButtonConfig].self, from: data) {
-            self.buttons = decoded
-        } else {
-            self.buttons = ButtonConfig.defaults
-        }
-    }
-
-    func save() {
-        if let data = try? JSONEncoder().encode(buttons) {
-            try? data.write(to: ButtonStore.settingsURL)
-        }
-    }
-
-    func resetToDefaults() {
-        buttons = ButtonConfig.defaults
-        save()
-    }
-}
-
 // MARK: - Settings View
 
 struct SettingsView: View {
     @Environment(\.uiScale) private var zoom
-    @ObservedObject var store: ButtonStore
     @Binding var isShowing: Bool
-    @State private var editingButtons: [ButtonConfig] = []
-    @State private var playlists: [String] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -927,11 +803,6 @@ struct SettingsView: View {
 
             ScrollView {
                 VStack(spacing: 16 * zoom) {
-                    ForEach($editingButtons) { $button in
-                        ButtonSettingsRow(config: $button, playlists: playlists)
-                    }
-
-                    // Skin picker
                     // Visualizer picker
                     HStack {
                         Image(systemName: AppState.shared.visualizerMode.icon)
@@ -964,194 +835,17 @@ struct SettingsView: View {
                 .padding(16 * zoom)
             }
 
-            Divider()
-
-            // Footer buttons
-            HStack(spacing: 12 * zoom) {
-                Button("Reset") {
-                    editingButtons = ButtonConfig.defaults
-                }
-                .buttonStyle(PlainButtonStyle())
-                .foregroundColor(.secondary)
-                .font(.system(size: 11 * zoom))
-
-                Spacer()
-
-                Button("Save") {
-                    store.buttons = editingButtons
-                    store.save()
-                    withAnimation(.easeInOut(duration: 0.2)) { isShowing = false }
-                }
-                .buttonStyle(PlainButtonStyle())
-                .foregroundColor(.blue)
-                .font(.system(size: 12 * zoom, weight: .semibold))
-            }
-            .padding(.horizontal, 16 * zoom)
-            .padding(.vertical, 10 * zoom)
         }
         .frame(width: 300 * zoom)
         .background(VisualEffectView())
         .clipShape(RoundedRectangle(cornerRadius: 12 * zoom))
         .shadow(color: .black.opacity(0.2), radius: 8 * zoom, x: 0, y: 4 * zoom)
-        .onAppear {
-            editingButtons = store.buttons
-            MusicController.fetchPlaylists { names in
-                playlists = names
-            }
-        }
-    }
-}
-
-struct ButtonSettingsRow: View {
-    @Environment(\.uiScale) private var zoom
-    @Binding var config: ButtonConfig
-    var playlists: [String] = []
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8 * zoom) {
-            // Preview
-            HStack(spacing: 10 * zoom) {
-                ZStack {
-                    Circle()
-                        .fill(config.color.opacity(0.15))
-                        .frame(width: 30 * zoom, height: 30 * zoom)
-                    Image(systemName: config.icon)
-                        .font(.system(size: 13 * zoom, weight: .semibold))
-                        .foregroundColor(config.color)
-                }
-
-                Text(config.title.isEmpty ? "Untitled" : config.title)
-                    .font(.system(size: 12 * zoom, weight: .semibold))
-                    .foregroundColor(config.title.isEmpty ? .secondary : .primary)
-
-                Spacer()
-            }
-
-            // Title field
-            HStack {
-                Text("Label")
-                    .font(.system(size: 10 * zoom))
-                    .foregroundColor(.secondary)
-                    .frame(width: 48 * zoom, alignment: .trailing)
-                TextField("Button name", text: $config.title)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .font(.system(size: 11 * zoom))
-            }
-
-            // Action type
-            HStack {
-                Text("Action")
-                    .font(.system(size: 10 * zoom))
-                    .foregroundColor(.secondary)
-                    .frame(width: 48 * zoom, alignment: .trailing)
-                Picker("", selection: $config.isFavorite) {
-                    Text("♥ Favorite Track").tag(true)
-                    Text("Add to Playlist").tag(false)
-                }
-                .pickerStyle(MenuPickerStyle())
-                .font(.system(size: 11 * zoom))
-                .labelsHidden()
-            }
-
-            // Playlist picker (only for non-favorite)
-            if !config.isFavorite {
-                HStack {
-                    Text("Playlist")
-                        .font(.system(size: 10 * zoom))
-                        .foregroundColor(.secondary)
-                        .frame(width: 48 * zoom, alignment: .trailing)
-                    if playlists.isEmpty {
-                        TextField("Playlist name", text: $config.playlist)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                            .font(.system(size: 11 * zoom))
-                    } else {
-                        Picker("", selection: $config.playlist) {
-                            Text("Select playlist...").tag("")
-                            ForEach(playlists, id: \.self) { name in
-                                Text(name).tag(name)
-                            }
-                        }
-                        .pickerStyle(MenuPickerStyle())
-                        .font(.system(size: 11 * zoom))
-                        .labelsHidden()
-                    }
-                }
-            }
-
-            // Color picker
-            HStack {
-                Text("Color")
-                    .font(.system(size: 10 * zoom))
-                    .foregroundColor(.secondary)
-                    .frame(width: 48 * zoom, alignment: .trailing)
-                HStack(spacing: 6 * zoom) {
-                    ForEach(ButtonConfig.availableColors, id: \.self) { colorName in
-                        Circle()
-                            .fill(colorFor(colorName))
-                            .frame(width: 16 * zoom, height: 16 * zoom)
-                            .overlay(
-                                Circle()
-                                    .stroke(Color.white, lineWidth: config.colorName == colorName ? 2 : 0)
-                            )
-                            .shadow(color: config.colorName == colorName ? colorFor(colorName).opacity(0.5) : .clear, radius: 3 * zoom)
-                            .onTapGesture { config.colorName = colorName }
-                    }
-                }
-            }
-
-            // Icon picker
-            HStack(alignment: .top) {
-                Text("Icon")
-                    .font(.system(size: 10 * zoom))
-                    .foregroundColor(.secondary)
-                    .frame(width: 48 * zoom, alignment: .trailing)
-                    .padding(.top, 2 * zoom)
-
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(22 * zoom), spacing: 4 * zoom), count: 8), spacing: 4 * zoom) {
-                    ForEach(ButtonConfig.availableIcons, id: \.self) { iconName in
-                        Image(systemName: iconName)
-                            .font(.system(size: 11 * zoom))
-                            .frame(width: 22 * zoom, height: 22 * zoom)
-                            .background(
-                                RoundedRectangle(cornerRadius: 4 * zoom)
-                                    .fill(config.icon == iconName ? config.color.opacity(0.2) : Color.clear)
-                            )
-                            .foregroundColor(config.icon == iconName ? config.color : .secondary)
-                            .onTapGesture { config.icon = iconName }
-                    }
-                }
-            }
-        }
-        .padding(12 * zoom)
-        .background(
-            RoundedRectangle(cornerRadius: 8 * zoom)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.3))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8 * zoom)
-                .stroke(Color(nsColor: .separatorColor).opacity(0.3), lineWidth: 1 * zoom)
-        )
-    }
-
-    func colorFor(_ name: String) -> Color {
-        switch name {
-        case "pink": return .pink
-        case "blue": return .blue
-        case "purple": return .purple
-        case "green": return .green
-        case "orange": return .orange
-        case "red": return .red
-        case "yellow": return .yellow
-        case "teal": return .teal
-        default: return .blue
-        }
     }
 }
 
 // MARK: - Main View
 
 struct ContentView: View {
-    @StateObject private var buttonStore = ButtonStore()
     @ObservedObject private var appState = AppState.shared
     @State private var currentTrack: String = ""
     @State private var currentArtist: String = ""
@@ -1160,7 +854,6 @@ struct ContentView: View {
     @State private var bannerMessage: String = ""
     @State private var bannerType: BannerType = .info
     @State private var showBanner: Bool = false
-    @State private var isLoading: [String: Bool] = [:]
     @State private var showSettings: Bool = false
     @State private var playlists: [String] = []
     @State private var shuffleEnabled: Bool = false
@@ -1183,11 +876,10 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             if showSettings {
-                SettingsView(store: buttonStore, isShowing: $showSettings)
+                SettingsView(isShowing: $showSettings)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             } else {
                 WinampView(
-                    buttonStore: buttonStore,
                     currentTrack: $currentTrack,
                     currentArtist: $currentArtist,
                     currentPlaylist: $currentPlaylist,
@@ -1197,7 +889,6 @@ struct ContentView: View {
                     showBanner: $showBanner,
                     bannerMessage: $bannerMessage,
                     bannerType: $bannerType,
-                    isLoading: $isLoading,
                     showSettings: $showSettings,
                     playlists: $playlists,
                     volume: $volume,
@@ -1207,21 +898,22 @@ struct ContentView: View {
                     showPlaylist: $appState.showPlaylist,
                     refreshTrackInfo: refreshTrackInfo,
                     resizeWindow: resizeWindow,
-                    performAction: performAction,
                     showResult: showResultTuple
                 )
             }
 
             // Playlist scroller — below the main player
             if appState.showPlaylist {
-            PlaylistScrollerView(isShowing: $appState.showPlaylist, currentPlaylist: $currentPlaylist, currentTrack: $currentTrack, refreshTrackInfo: refreshTrackInfo)
-                .frame(height: 250 * appState.zoomLevel)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
+                PlaylistScrollerView(isShowing: $appState.showPlaylist, currentPlaylist: $currentPlaylist, currentTrack: $currentTrack, refreshTrackInfo: refreshTrackInfo)
+                    .overlay(alignment: .bottom) { PanelResizeHandle(height: $appState.playlistHeight) }
+                    .frame(height: appState.playlistHeight * appState.zoomLevel)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
 
             if appState.showSearch {
                 SearchPanelView(isShowing: $appState.showSearch)
-                    .frame(height: 300 * appState.zoomLevel)
+                    .overlay(alignment: .bottom) { PanelResizeHandle(height: $appState.searchHeight) }
+                    .frame(height: appState.searchHeight * appState.zoomLevel)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         } // end VStack
@@ -1230,7 +922,7 @@ struct ContentView: View {
         .environment(\.uiScale, CGFloat(appState.zoomLevel))
         .frame(
             width: 300 * appState.zoomLevel,
-            height: (520 + (appState.showExpandedArt ? 300 : 0) + (appState.showPlaylist ? 250 : 0) + (appState.showSearch ? 300 : 0)) * appState.zoomLevel,
+            height: appState.windowHeight * appState.zoomLevel,
             alignment: .topLeading
         )
         .animation(.easeInOut(duration: 0.25), value: appState.showPlaylist)
@@ -1238,6 +930,9 @@ struct ContentView: View {
         // Panels can also be closed from their own X buttons, so size the window here.
         .onChange(of: appState.showPlaylist) { _, _ in resizeWindow() }
         .onChange(of: appState.showSearch) { _, _ in resizeWindow() }
+        // Panel drags resize the window live, so no delay or animation.
+        .onChange(of: appState.playlistHeight) { _, _ in fitWindow(animate: false) }
+        .onChange(of: appState.searchHeight) { _, _ in fitWindow(animate: false) }
         .onAppear {
             refreshTrackInfo()
             MusicController.fetchPlaylists { names in playlists = names }
@@ -1279,26 +974,19 @@ struct ContentView: View {
 
 
     func resizeWindow() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            if let window = AppDelegate.shared?.mainWindow {
-                let zoom = CGFloat(self.appState.zoomLevel)
-                let baseWidth: CGFloat = 300 * zoom
-                let artHeight: CGFloat = self.appState.showExpandedArt ? 300 * zoom : 0
-                let baseHeight: CGFloat = 520 * zoom
-                let playlistHeight: CGFloat = self.appState.showPlaylist ? 250 * zoom : 0
-                let searchHeight: CGFloat = self.appState.showSearch ? 300 * zoom : 0
-                let targetWidth = baseWidth
-                let targetHeight = baseHeight + artHeight + playlistHeight + searchHeight
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { fitWindow(animate: true) }
+    }
 
-                var frame = window.frame
-                // Keep top-left anchored — expand downward
-                let heightDiff = targetHeight - frame.height
-                frame.origin.y -= heightDiff
-                frame.size.width = targetWidth
-                frame.size.height = targetHeight
-                window.setFrame(frame, display: true, animate: true)
-            }
-        }
+    func fitWindow(animate: Bool) {
+        guard let window = AppDelegate.shared?.mainWindow else { return }
+        let zoom = CGFloat(appState.zoomLevel)
+        var frame = window.frame
+        let targetHeight = CGFloat(appState.windowHeight) * zoom
+        // Keep top-left anchored — expand downward
+        frame.origin.y -= targetHeight - frame.height
+        frame.size.width = 300 * zoom
+        frame.size.height = targetHeight
+        window.setFrame(frame, display: true, animate: animate)
     }
 
     func refreshTrackInfo() {
@@ -1344,19 +1032,11 @@ struct ContentView: View {
         }
     }
 
-    func performAction(key: String, action: () -> Void) {
-        isLoading[key] = true
-        action()
-    }
-
     func showResultTuple(success: Bool, message: String) {
         showResult(success: success, message: message)
     }
 
     func showResult(success: Bool, message: String) {
-        // Reset all loading
-        isLoading = [:]
-
         withAnimation(.easeInOut(duration: 0.25)) {
             bannerMessage = message
             bannerType = success ? .success : .error
@@ -1371,78 +1051,6 @@ struct ContentView: View {
 
         // Refresh track info
         refreshTrackInfo()
-    }
-}
-
-// MARK: - Action Button
-
-struct ActionButton: View {
-    @Environment(\.uiScale) private var zoom
-    let title: String
-    let subtitle: String
-    let icon: String
-    let color: Color
-    let isLoading: Bool
-    let action: () -> Void
-    
-    @State private var isHovered = false
-    @State private var isPressed = false
-    
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12 * zoom) {
-                ZStack {
-                    Circle()
-                        .fill(color.opacity(0.15))
-                        .frame(width: 36 * zoom, height: 36 * zoom)
-                    
-                    if isLoading {
-                        ProgressView()
-                            .scaleEffect(0.5 * zoom)
-                    } else {
-                        Image(systemName: icon)
-                            .font(.system(size: 15 * zoom, weight: .semibold))
-                            .foregroundColor(color)
-                    }
-                }
-                
-                VStack(alignment: .leading, spacing: 1 * zoom) {
-                    Text(title)
-                        .font(.system(size: 13 * zoom, weight: .semibold))
-                        .foregroundColor(.primary)
-                    Text(subtitle)
-                        .font(.system(size: 10 * zoom))
-                        .foregroundColor(.secondary)
-                }
-                
-                Spacer()
-                
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 16 * zoom))
-                    .foregroundColor(color.opacity(isHovered ? 1.0 : 0.5))
-            }
-            .padding(.horizontal, 12 * zoom)
-            .padding(.vertical, 10 * zoom)
-            .background(
-                RoundedRectangle(cornerRadius: 10 * zoom)
-                    .fill(isPressed ? color.opacity(0.1) : (isHovered ? color.opacity(0.06) : Color.clear))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10 * zoom)
-                    .stroke(isHovered ? color.opacity(0.3) : Color.clear, lineWidth: 1 * zoom)
-            )
-        }
-        .buttonStyle(PlainButtonStyle())
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                isHovered = hovering
-            }
-        }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in isPressed = true }
-                .onEnded { _ in isPressed = false }
-        )
     }
 }
 
@@ -1798,6 +1406,10 @@ struct PlaylistScrollerView: View {
             // The list follows whatever Music is playing from.
             if !MusicController.isJumping { loadTracks() }
         }
+        .onReceive(CatalogPlayer.shared.changed) { _ in
+            // ZenAmp's own queue is cheap to read, so just re-list it on every change.
+            if CatalogPlayer.shared.isActive { tracks = CatalogPlayer.shared.queueTracks() }
+        }
         .onChange(of: currentTrack) { newTrack in
             // Just update the highlight, don't re-fetch the entire playlist
             for i in tracks.indices {
@@ -1927,6 +1539,10 @@ struct PlaylistScrollerView: View {
         .background(track.isPlaying ? theme.activeBg : (track.id % 2 == 0 ? theme.rowBg1 : theme.rowBg2))
         .contentShape(Rectangle())
         .onTapGesture {
+            if CatalogPlayer.shared.isActive {
+                CatalogPlayer.shared.jump(toEntryID: track.dbID)
+                return
+            }
             guard !MusicController.isJumping,
                   let pid = MusicController.currentPlaylistPersistentID else { return }
             jumpingToTrackID = track.id
@@ -1971,6 +1587,12 @@ struct PlaylistScrollerView: View {
     }
 
     private func loadTracks() {
+        // While ZenAmp is playing a catalog pick, the list is its own queue.
+        if CatalogPlayer.shared.isActive {
+            tracks = CatalogPlayer.shared.queueTracks()
+            isLoading = false
+            return
+        }
         isLoading = true
         MusicController.fetchCurrentPlaylistTracks { result in
             defer { isLoading = false }
@@ -1979,6 +1601,38 @@ struct PlaylistScrollerView: View {
             if result.isEmpty && !tracks.isEmpty { return }
             tracks = result.enumerated().map { PlaylistTrack(id: $0.offset, dbID: $0.element.dbID, name: $0.element.name, artist: $0.element.artist, duration: $0.element.duration, isPlaying: $0.element.isPlaying) }
         }
+    }
+}
+
+// MARK: - Panel Resize Handle
+
+/// A strip along a panel's bottom edge that drags the panel taller or shorter.
+struct PanelResizeHandle: View {
+    @Environment(\.uiScale) private var zoom
+    @Binding var height: Double
+    @State private var startHeight: Double?
+
+    var body: some View {
+        Capsule()
+            .fill(Color.green.opacity(0.35))
+            .frame(width: 28 * zoom, height: 2 * zoom)
+            .frame(maxWidth: .infinity, minHeight: 7 * zoom)
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            // Window coordinates stay put while the window grows downward
+            // under the pointer, unlike the handle's own moving frame.
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { drag in
+                        let start = startHeight ?? height
+                        startHeight = start
+                        let proposed = start + drag.translation.height / zoom
+                        height = min(max(proposed, AppState.panelHeightRange.lowerBound), AppState.panelHeightRange.upperBound)
+                    }
+                    .onEnded { _ in startHeight = nil }
+            )
     }
 }
 
@@ -2139,9 +1793,15 @@ final class CatalogPlayer {
                 player.queue = [song]
             }
         case .album:
-            let request = MusicCatalogResourceRequest<Album>(matching: \.id, equalTo: itemID)
+            var request = MusicCatalogResourceRequest<Album>(matching: \.id, equalTo: itemID)
+            request.properties = [.tracks]
             guard let album = try await request.response().items.first else { throw Failure.notFound }
-            player.queue = [album]
+            // Queue the tracks rather than the album so the playlist panel can list them.
+            if let tracks = album.tracks, !tracks.isEmpty {
+                player.queue = ApplicationMusicPlayer.Queue(for: tracks)
+            } else {
+                player.queue = [album]
+            }
         case .artist:
             var request = MusicCatalogResourceRequest<Artist>(matching: \.id, equalTo: itemID)
             request.properties = [.topSongs]
@@ -2200,6 +1860,40 @@ final class CatalogPlayer {
         )
     }
 
+    /// The queue as playlist rows; `dbID` carries the queue entry's ID.
+    func queueTracks() -> [PlaylistTrack] {
+        let current = player.queue.currentEntry?.id
+        return player.queue.entries.enumerated().map { index, entry in
+            var length = ""
+            if case .song(let song) = entry.item, let seconds = song.duration {
+                length = "\(Int(seconds) / 60):\(String(format: "%02d", Int(seconds) % 60))"
+            }
+            return PlaylistTrack(id: index, dbID: entry.id, name: entry.title, artist: entry.subtitle ?? "",
+                                 duration: length, isPlaying: entry.id == current)
+        }
+    }
+
+    /// Favorites the playing song on the Apple Music account (a "love" rating —
+    /// MusicKit on macOS has no library or favorites API). Returns its title.
+    func favoriteCurrent() async throws -> String {
+        guard case .song(let song)? = player.queue.currentEntry?.item,
+              let url = URL(string: "https://api.music.apple.com/v1/me/ratings/songs/\(song.id.rawValue)") else {
+            throw Failure.notFound
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["type": "rating", "attributes": ["value": 1]])
+        _ = try await MusicDataRequest(urlRequest: request).response()
+        return song.title
+    }
+
+    func jump(toEntryID id: String) {
+        guard let entry = player.queue.entries.first(where: { $0.id == id }) else { return }
+        player.queue.currentEntry = entry
+        Task { try? await player.play() }
+    }
+
     func fetchArtwork(completion: @escaping (NSImage?) -> Void) {
         guard let url = player.queue.currentEntry?.artwork?.url(width: 256, height: 256) else {
             completion(nil)
@@ -2215,6 +1909,20 @@ final class CatalogPlayer {
 /// Sends transport presses to whichever player is active.
 @MainActor
 enum Transport {
+    static func favorite(completion: @escaping (Bool, String) -> Void) {
+        guard CatalogPlayer.shared.isActive else {
+            MusicController.favoriteCurrentTrack(completion: completion)
+            return
+        }
+        Task {
+            do {
+                completion(true, "Favorited: " + (try await CatalogPlayer.shared.favoriteCurrent()))
+            } catch {
+                completion(false, "Couldn't favorite this song")
+            }
+        }
+    }
+
     static func playPause(completion: @escaping () -> Void) {
         if CatalogPlayer.shared.isActive {
             CatalogPlayer.shared.playPause()
@@ -2259,8 +1967,8 @@ final class SearchModel: ObservableObject {
     @Published var results: [CatalogResult] = []
     @Published var selection: Int?
     @Published var status = "TYPE TO SEARCH APPLE MUSIC"
-    /// Bumped by the FIND button to focus the field and select its text.
-    @Published var focusRequest = 0
+    /// Latest Apple Music suggestion for the query, e.g. "tycho" for "tyc".
+    @Published private var suggestion = ""
     private var cache: [String: [CatalogResult]] = [:]
     private var shownKey = ""
 
@@ -2303,6 +2011,37 @@ final class SearchModel: ObservableObject {
 
     private func summary(_ found: [CatalogResult]) -> String {
         found.isEmpty ? "NO MATCHES" : "\(found.count) RESULT\(found.count == 1 ? "" : "S")"
+    }
+
+    /// The untyped rest of the suggestion, shown greyed after the cursor.
+    var completion: String {
+        guard !query.isEmpty, suggestion.count > query.count,
+              suggestion.lowercased().hasPrefix(query.lowercased()) else { return "" }
+        return String(suggestion.dropFirst(query.count))
+    }
+
+    /// Fetches a completion for the query. Needs Apple Music access, which is
+    /// granted on the first play, so it never prompts while typing.
+    func suggest() async {
+        let term = query
+        guard !term.trimmingCharacters(in: .whitespaces).isEmpty,
+              MusicAuthorization.currentStatus == .authorized else { return }
+        do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
+        var request = MusicCatalogSearchSuggestionsRequest(term: term)
+        request.limit = 10
+        guard let response = try? await request.response(), !Task.isCancelled else { return }
+        let lowered = term.lowercased()
+        suggestion = response.suggestions
+            .map(\.searchTerm)
+            .first { $0.count > term.count && $0.lowercased().hasPrefix(lowered) } ?? ""
+    }
+
+    /// Takes the greyed completion into the query. False when there is none.
+    func acceptCompletion() -> Bool {
+        let rest = completion
+        guard !rest.isEmpty else { return false }
+        query += rest
+        return true
     }
 
     func moveSelection(_ step: Int) {
@@ -2363,16 +2102,40 @@ struct SearchPanelView: View {
         .border(theme.border, width: 1 * zoom)
         .clipShape(RoundedRectangle(cornerRadius: 4 * zoom))
         .onAppear(perform: focusField)
-        .onChange(of: model.focusRequest) { _, _ in focusField() }
+        .onChange(of: fieldFocused) { wasFocused, focused in
+            if focused && !wasFocused { selectAllAfterClick() }
+        }
         // Restarts (cancelling the previous run) whenever the query or scope changes.
         .task(id: "\(model.scope.rawValue)|\(model.query)") { await model.search() }
+        .task(id: model.query) { await model.suggest() }
     }
 
     /// Focuses the field with its text selected, so typing replaces the last search.
     private func focusField() {
         fieldFocused = true
-        DispatchQueue.main.async {
-            NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: nil)
+        DispatchQueue.main.async(execute: Self.selectAll)
+    }
+
+    private static func selectAll() {
+        NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: nil)
+    }
+
+    private static var mouseUpMonitor: Any?
+
+    /// Like a browser's address bar: the click that focuses the field selects
+    /// its text, later clicks place the cursor. The click itself positions the
+    /// cursor on mouse-up, so the select-all has to wait until after that.
+    private func selectAllAfterClick() {
+        guard NSApp.currentEvent?.type == .leftMouseDown else {
+            DispatchQueue.main.async(execute: Self.selectAll)
+            return
+        }
+        if let monitor = Self.mouseUpMonitor { NSEvent.removeMonitor(monitor) }
+        Self.mouseUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { event in
+            if let monitor = Self.mouseUpMonitor { NSEvent.removeMonitor(monitor) }
+            Self.mouseUpMonitor = nil
+            DispatchQueue.main.async(execute: Self.selectAll)
+            return event
         }
     }
 
@@ -2396,23 +2159,32 @@ struct SearchPanelView: View {
     }
 
     var searchField: some View {
-        TextField("", text: $model.query, prompt: Text("ARTIST, ALBUM OR SONG").foregroundColor(theme.primary.opacity(0.3)))
-            .textFieldStyle(.plain)
-            .font(.system(size: 10 * zoom, design: .monospaced))
-            .foregroundColor(theme.primary)
-            .focused($fieldFocused)
-            .padding(.horizontal, 6 * zoom)
-            .padding(.vertical, 4 * zoom)
-            .background(Color.black.opacity(0.6))
-            .overlay(RoundedRectangle(cornerRadius: 2 * zoom).stroke(theme.primary.opacity(0.3), lineWidth: 1 * zoom))
-            .padding(.horizontal, 6 * zoom)
-            .padding(.top, 6 * zoom)
-            .onSubmit { model.playSelection() }
-            .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
-            .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
-            .onExitCommand {
-                if model.query.isEmpty { close() } else { model.query = "" }
-            }
+        ZStack(alignment: .leading) {
+            // Autocomplete: the typed text invisibly, then the rest of the suggestion greyed.
+            Text("\(Text(model.query).foregroundColor(.clear))\(Text(model.completion).foregroundColor(theme.primary.opacity(0.35)))")
+                .font(.system(size: 10 * zoom, design: .monospaced))
+                .lineLimit(1)
+                .allowsHitTesting(false)
+            TextField("", text: $model.query, prompt: Text("ARTIST, ALBUM OR SONG").foregroundColor(theme.primary.opacity(0.3)))
+                .textFieldStyle(.plain)
+                .font(.system(size: 10 * zoom, design: .monospaced))
+                .foregroundColor(theme.primary)
+                .focused($fieldFocused)
+        }
+        .padding(.horizontal, 6 * zoom)
+        .padding(.vertical, 4 * zoom)
+        .background(Color.black.opacity(0.6))
+        .overlay(RoundedRectangle(cornerRadius: 2 * zoom).stroke(theme.primary.opacity(0.3), lineWidth: 1 * zoom))
+        .padding(.horizontal, 6 * zoom)
+        .padding(.top, 6 * zoom)
+        .onSubmit { model.playSelection() }
+        .onKeyPress(.tab) { model.acceptCompletion() ? .handled : .ignored }
+        .onKeyPress(.rightArrow) { model.acceptCompletion() ? .handled : .ignored }
+        .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
+        .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
+        .onExitCommand {
+            if model.query.isEmpty { close() } else { model.query = "" }
+        }
     }
 
     var scopeBar: some View {
@@ -2507,7 +2279,6 @@ struct SearchPanelView: View {
 
 struct WinampView: View {
     @Environment(\.uiScale) private var zoom
-    @ObservedObject var buttonStore: ButtonStore
     @Binding var currentTrack: String
     @Binding var currentArtist: String
     @Binding var currentPlaylist: String
@@ -2517,7 +2288,6 @@ struct WinampView: View {
     @Binding var showBanner: Bool
     @Binding var bannerMessage: String
     @Binding var bannerType: BannerType
-    @Binding var isLoading: [String: Bool]
     @Binding var showSettings: Bool
     @Binding var playlists: [String]
     @Binding var volume: Double
@@ -2527,7 +2297,6 @@ struct WinampView: View {
     @Binding var showPlaylist: Bool
     var refreshTrackInfo: () -> Void
     var resizeWindow: () -> Void
-    var performAction: (String, () -> Void) -> Void
     var showResult: (Bool, String) -> Void
 
     // Winamp green: #00FF00, amber: #FFAA00
@@ -2551,9 +2320,6 @@ struct WinampView: View {
 
             // Transport controls
             transportControls
-
-            // Playlist action buttons (styled as winamp buttons)
-            actionButtons
 
             // Status bar
             statusBar
@@ -2778,6 +2544,10 @@ struct WinampView: View {
                 Transport.playPause { refreshTrackInfo() }
             }
 
+            winampButton(icon: "heart.fill", label: "FAV", highlight: true) {
+                Transport.favorite { success, message in showResult(success, message) }
+            }
+
             Spacer()
 
             // Shuffle
@@ -2796,16 +2566,12 @@ struct WinampView: View {
             }
 
             // Apple Music search toggle
-            // Opens the search, or refocuses it if open; X or Esc closes it.
+            // Apple Music search toggle; opening focuses the field with its text selected.
             winampButton(icon: "magnifyingglass", label: "FIND", active: AppState.shared.showSearch) {
-                if AppState.shared.showSearch {
-                    SearchModel.shared.focusRequest += 1
-                } else {
-                    withAnimation(.easeInOut(duration: 0.25)) {
-                        AppState.shared.showSearch = true
-                    }
-                    resizeWindow()
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    AppState.shared.showSearch.toggle()
                 }
+                resizeWindow()
             }
         }
         .padding(.horizontal, 6 * zoom)
@@ -2821,7 +2587,7 @@ struct WinampView: View {
                     .font(.system(size: 6 * zoom, weight: .bold, design: .monospaced))
             }
             .foregroundColor(active ? winAmber : (highlight ? winGreen : winGreen.opacity(0.7)))
-            .frame(width: 36 * zoom, height: 32 * zoom)
+            .frame(width: 31 * zoom, height: 32 * zoom)
             .background(
                 RoundedRectangle(cornerRadius: 3 * zoom)
                     .fill(winMidBg)
@@ -2832,68 +2598,7 @@ struct WinampView: View {
             )
         }
         .buttonStyle(PlainButtonStyle())
-        .padding(.horizontal, 2 * zoom)
-    }
-
-    var actionButtons: some View {
-        VStack(spacing: 3 * zoom) {
-            ForEach(buttonStore.buttons) { config in
-                Button(action: {
-                    if config.isFavorite {
-                        performAction(config.id) {
-                            MusicController.favoriteCurrentTrack { success, message in
-                                showResult(success, message)
-                            }
-                        }
-                    } else {
-                        performAction(config.id) {
-                            MusicController.addCurrentTrackToPlaylist(config.playlist) { success, message in
-                                showResult(success, message)
-                            }
-                        }
-                    }
-                }) {
-                    HStack(spacing: 8 * zoom) {
-                        Image(systemName: config.icon)
-                            .font(.system(size: 10 * zoom, weight: .bold))
-                            .foregroundColor(winGreen)
-                            .frame(width: 16 * zoom)
-
-                        Text(config.title.uppercased())
-                            .font(.system(size: 9 * zoom, weight: .bold, design: .monospaced))
-                            .foregroundColor(winGreen.opacity(0.9))
-
-                        Spacer()
-
-                        if isLoading[config.id] == true {
-                            ProgressView()
-                                .scaleEffect(0.4 * zoom)
-                        } else {
-                            Text(config.isFavorite ? "FAV" : "ADD")
-                                .font(.system(size: 7 * zoom, weight: .bold, design: .monospaced))
-                                .foregroundColor(winAmber.opacity(0.6))
-                        }
-
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 7 * zoom))
-                            .foregroundColor(winGreen.opacity(0.3))
-                    }
-                    .padding(.horizontal, 10 * zoom)
-                    .padding(.vertical, 6 * zoom)
-                    .background(
-                        RoundedRectangle(cornerRadius: 2 * zoom)
-                            .fill(winMidBg)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 2 * zoom)
-                                    .stroke(winGreen.opacity(0.1), lineWidth: 1 * zoom)
-                            )
-                    )
-                }
-                .buttonStyle(PlainButtonStyle())
-            }
-        }
-        .padding(.horizontal, 6 * zoom)
-        .padding(.vertical, 4 * zoom)
+        .padding(.horizontal, 1.5 * zoom)
     }
 
     var statusBar: some View {
@@ -2974,23 +2679,27 @@ struct AppPrefs: Codable {
     var showExpandedArt: Bool = false
     var showPlaylist: Bool = false
     var zoomLevel: Double = 1.5
+    // Optional so prefs files written before these existed still decode.
+    var playlistHeight: Double?
+    var searchHeight: Double?
 }
 
 class AppState: ObservableObject {
     static let shared = AppState()
     @Published var visualizerMode: VisualizerMode = .bars { didSet { savePrefs() } }
     @Published var showExpandedArt: Bool = false { didSet { savePrefs() } }
-    @Published var showPlaylist: Bool = false {
-        didSet {
-            savePrefs()
-            if showPlaylist { showSearch = false }
-        }
-    }
-    /// The search panel and playlist panel replace each other below the player.
-    @Published var showSearch: Bool = false {
-        didSet { if showSearch { showPlaylist = false } }
-    }
+    @Published var showPlaylist: Bool = false { didSet { savePrefs() } }
+    @Published var showSearch: Bool = false
     @Published var zoomLevel: Double = 1.5 { didSet { savePrefs() } }
+    /// Panel heights in unzoomed points, set by dragging their bottom edges.
+    @Published var playlistHeight: Double = 250 { didSet { savePrefs() } }
+    @Published var searchHeight: Double = 300 { didSet { savePrefs() } }
+    static let panelHeightRange: ClosedRange<Double> = 120...900
+
+    /// Window height in unzoomed points: the player plus whatever is open below it.
+    var windowHeight: Double {
+        520 + (showExpandedArt ? 300 : 0) + (showPlaylist ? playlistHeight : 0) + (showSearch ? searchHeight : 0)
+    }
     /// False when the window is fully covered, hidden, or on another Space.
     @Published var isWindowVisible: Bool = true
 
@@ -3010,6 +2719,8 @@ class AppState: ObservableObject {
             self.showExpandedArt = prefs.showExpandedArt
             self.showPlaylist = prefs.showPlaylist
             self.zoomLevel = prefs.zoomLevel
+            self.playlistHeight = prefs.playlistHeight ?? playlistHeight
+            self.searchHeight = prefs.searchHeight ?? searchHeight
         }
         suppressSave = false
     }
@@ -3020,7 +2731,9 @@ class AppState: ObservableObject {
             visualizerMode: visualizerMode.rawValue,
             showExpandedArt: showExpandedArt,
             showPlaylist: showPlaylist,
-            zoomLevel: zoomLevel
+            zoomLevel: zoomLevel,
+            playlistHeight: playlistHeight,
+            searchHeight: searchHeight
         )
         if let data = try? JSONEncoder().encode(prefs) {
             try? data.write(to: AppState.prefsURL)
@@ -3074,6 +2787,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        NSApp.mainMenu = Self.makeMainMenu()
 
         let window = BorderlessKeyWindow(
             contentRect: NSRect(x: 0, y: 0, width: 300, height: 520),
@@ -3128,6 +2842,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+    }
+
+    /// The app is launched without a storyboard, so it has no menu bar until one
+    /// is built — and without an Edit menu, ⌘A/⌘C/⌘V/⌘Z don't reach text fields.
+    private static func makeMainMenu() -> NSMenu {
+        let main = NSMenu()
+
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About ZenAmp", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide ZenAmp", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Quit ZenAmp", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        main.addItem(withTitle: "ZenAmp", action: nil, keyEquivalent: "").submenu = appMenu
+
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        main.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = editMenu
+
+        return main
     }
 
     /// Makes the title bar drag the window.
