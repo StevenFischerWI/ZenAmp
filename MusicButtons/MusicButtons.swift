@@ -2,6 +2,8 @@ import SwiftUI
 import AppKit
 import CoreAudio
 import ImageIO
+import MusicKit
+import Combine
 
 // MARK: - Audio Output Manager
 
@@ -407,6 +409,10 @@ class MusicController {
     static func playPause(completion: (() -> Void)? = nil) {
         let script = "tell application \"Music\" to playpause"
         runAppleScript(script) { _, _ in completion?() }
+    }
+
+    static func pause() {
+        runAppleScript("tell application \"Music\" to if it is running then pause") { _, _ in }
     }
 
     static func nextTrack(completion: (() -> Void)? = nil) {
@@ -1212,25 +1218,42 @@ struct ContentView: View {
                 .frame(height: 250 * appState.zoomLevel)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
         }
+
+            if appState.showSearch {
+                SearchPanelView(isShowing: $appState.showSearch)
+                    .frame(height: 300 * appState.zoomLevel)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         } // end VStack
         // Sizes are multiplied by the zoom rather than using scaleEffect, which
         // stretches the 1x rasterised layers and blurs text and icons.
         .environment(\.uiScale, CGFloat(appState.zoomLevel))
         .frame(
             width: 300 * appState.zoomLevel,
-            height: (520 + (appState.showExpandedArt ? 300 : 0) + (appState.showPlaylist ? 250 : 0)) * appState.zoomLevel,
+            height: (520 + (appState.showExpandedArt ? 300 : 0) + (appState.showPlaylist ? 250 : 0) + (appState.showSearch ? 300 : 0)) * appState.zoomLevel,
             alignment: .topLeading
         )
         .animation(.easeInOut(duration: 0.25), value: appState.showPlaylist)
+        .animation(.easeInOut(duration: 0.25), value: appState.showSearch)
+        // Panels can also be closed from their own X buttons, so size the window here.
+        .onChange(of: appState.showPlaylist) { _, _ in resizeWindow() }
+        .onChange(of: appState.showSearch) { _, _ in resizeWindow() }
         .onAppear {
             refreshTrackInfo()
             MusicController.fetchPlaylists { names in playlists = names }
             MusicController.getShuffleState { enabled in shuffleEnabled = enabled }
             MusicController.getVolume { v in volume = v }
         }
-        .onReceive(playerInfoChanged) { _ in
+        .onReceive(playerInfoChanged) { note in
+            // Music playing again (from Music itself, the playlist menu or panel) takes back the transport.
+            if note.userInfo?["Player State"] as? String == "Playing" {
+                CatalogPlayer.shared.deactivate()
+            }
             guard !MusicController.isJumping else { return }
             refreshTrackInfo()
+        }
+        .onReceive(CatalogPlayer.shared.changed) { _ in
+            if CatalogPlayer.shared.isActive { refreshTrackInfo() }
         }
         .onReceive(timer) { _ in
             // Fallback resync; skipped while a refresh is still running so a slow
@@ -1263,8 +1286,9 @@ struct ContentView: View {
                 let artHeight: CGFloat = self.appState.showExpandedArt ? 300 * zoom : 0
                 let baseHeight: CGFloat = 520 * zoom
                 let playlistHeight: CGFloat = self.appState.showPlaylist ? 250 * zoom : 0
+                let searchHeight: CGFloat = self.appState.showSearch ? 300 * zoom : 0
                 let targetWidth = baseWidth
-                let targetHeight = baseHeight + artHeight + playlistHeight
+                let targetHeight = baseHeight + artHeight + playlistHeight + searchHeight
 
                 var frame = window.frame
                 // Keep top-left anchored — expand downward
@@ -1278,33 +1302,43 @@ struct ContentView: View {
     }
 
     func refreshTrackInfo() {
+        if CatalogPlayer.shared.isActive {
+            apply(CatalogPlayer.shared.trackInfo(), fetchArtwork: CatalogPlayer.shared.fetchArtwork)
+            return
+        }
         refreshesInFlight += 1
         MusicController.getCurrentTrackInfo { info in
             refreshesInFlight -= 1
-            withAnimation(.easeInOut(duration: 0.2)) {
-                currentTrack = info?.name ?? ""
-                currentArtist = info?.artist ?? ""
-                currentPlaylist = info?.playlist ?? ""
-                isPlaying = info?.isPlaying ?? false
-            }
-            positionAnchor = info?.position ?? 0
-            positionAnchorDate = Date()
-            playerPosition = info?.position ?? 0
-            trackDuration = info?.duration ?? 0
-            // Only fetch artwork when track changes — crossfade
-            let trackKey = (info?.name ?? "") + (info?.artist ?? "")
-            if trackKey != lastArtTrack {
-                lastArtTrack = trackKey
-                if info != nil {
-                    MusicController.fetchArtwork { image in
-                        withAnimation(.easeInOut(duration: 0.6)) {
-                            albumArt = image
-                        }
+            // A catalog pick may have started while this script ran.
+            guard !CatalogPlayer.shared.isActive else { return }
+            apply(info, fetchArtwork: MusicController.fetchArtwork)
+        }
+    }
+
+    private func apply(_ info: MusicController.TrackInfo?, fetchArtwork: @escaping (@escaping (NSImage?) -> Void) -> Void) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            currentTrack = info?.name ?? ""
+            currentArtist = info?.artist ?? ""
+            currentPlaylist = info?.playlist ?? ""
+            isPlaying = info?.isPlaying ?? false
+        }
+        positionAnchor = info?.position ?? 0
+        positionAnchorDate = Date()
+        playerPosition = info?.position ?? 0
+        trackDuration = info?.duration ?? 0
+        // Only fetch artwork when track changes — crossfade
+        let trackKey = (info?.name ?? "") + (info?.artist ?? "")
+        if trackKey != lastArtTrack {
+            lastArtTrack = trackKey
+            if info != nil {
+                fetchArtwork { image in
+                    withAnimation(.easeInOut(duration: 0.6)) {
+                        albumArt = image
                     }
-                } else {
-                    withAnimation(.easeInOut(duration: 0.4)) {
-                        albumArt = nil
-                    }
+                }
+            } else {
+                withAnimation(.easeInOut(duration: 0.4)) {
+                    albumArt = nil
                 }
             }
         }
@@ -1948,6 +1982,527 @@ struct PlaylistScrollerView: View {
     }
 }
 
+// MARK: - Apple Music Search
+
+struct CatalogResult: Identifiable {
+    enum Kind { case song, album, artist }
+    let id: Int
+    let kind: Kind
+    let name: String
+    let detail: String  // artist · album
+    let extra: String   // length, year · tracks, or genre
+    let url: URL?
+    let catalogID: String?  // iTunes Search IDs are Apple Music catalog IDs
+
+    var mark: String {
+        switch kind {
+        case .song: return "♪"
+        case .album: return "◉"
+        case .artist: return "★"
+        }
+    }
+}
+
+/// Apple's public iTunes Search API: no account or key, ~20 requests a minute.
+enum CatalogSearch {
+    enum Scope: String, CaseIterable {
+        case all = "ALL", songs = "SONGS", albums = "ALBUMS", artists = "ARTISTS"
+
+        var entity: String {
+            switch self {
+            case .all: return "musicArtist,album,song"
+            case .songs: return "song"
+            case .albums: return "album"
+            case .artists: return "musicArtist"
+            }
+        }
+    }
+
+    enum Failure: Error {
+        case rateLimited
+        case http(Int)
+    }
+
+    private struct Response: Decodable {
+        let results: [Item]
+    }
+
+    private struct Item: Decodable {
+        let wrapperType: String?
+        let kind: String?
+        let trackName: String?
+        let artistName: String?
+        let collectionName: String?
+        let trackTimeMillis: Int?
+        let releaseDate: String?
+        let trackCount: Int?
+        let primaryGenreName: String?
+        let trackViewUrl: String?
+        let collectionViewUrl: String?
+        let artistLinkUrl: String?
+        let trackId: Int?
+        let collectionId: Int?
+        let artistId: Int?
+    }
+
+    /// Storefront for the Mac's region, e.g. "us".
+    static let country = (Locale.current.region?.identifier ?? "US").lowercased()
+
+    static func search(_ term: String, scope: Scope) async throws -> [CatalogResult] {
+        var components = URLComponents(string: "https://itunes.apple.com/search")!
+        components.queryItems = [
+            URLQueryItem(name: "term", value: term),
+            URLQueryItem(name: "media", value: "music"),
+            URLQueryItem(name: "entity", value: scope.entity),
+            URLQueryItem(name: "country", value: country),
+            URLQueryItem(name: "limit", value: "50"),
+        ]
+        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            throw [403, 429].contains(http.statusCode) ? Failure.rateLimited : Failure.http(http.statusCode)
+        }
+        let items = try JSONDecoder().decode(Response.self, from: data).results
+        return items.enumerated().compactMap { result(from: $0.element, id: $0.offset) }
+    }
+
+    private static func result(from item: Item, id: Int) -> CatalogResult? {
+        let artist = item.artistName ?? ""
+        switch item.wrapperType {
+        case "track" where item.kind == "song":
+            let ms = item.trackTimeMillis ?? 0
+            let length = ms > 0 ? "\(ms / 60000):\(String(format: "%02d", ms / 1000 % 60))" : ""
+            let detail = [artist, item.collectionName ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
+            return CatalogResult(id: id, kind: .song, name: item.trackName ?? "", detail: detail,
+                                 extra: length, url: item.trackViewUrl.flatMap(URL.init(string:)),
+                                 catalogID: item.trackId.map(String.init))
+        case "collection":
+            let year = String((item.releaseDate ?? "").prefix(4))
+            let tracks = item.trackCount.map { "\($0) track\($0 == 1 ? "" : "s")" } ?? ""
+            let extra = [year, tracks].filter { !$0.isEmpty }.joined(separator: " · ")
+            return CatalogResult(id: id, kind: .album, name: item.collectionName ?? "", detail: artist,
+                                 extra: extra, url: item.collectionViewUrl.flatMap(URL.init(string:)),
+                                 catalogID: item.collectionId.map(String.init))
+        case "artist":
+            return CatalogResult(id: id, kind: .artist, name: artist, detail: "",
+                                 extra: item.primaryGenreName ?? "", url: item.artistLinkUrl.flatMap(URL.init(string:)),
+                                 catalogID: item.artistId.map(String.init))
+        default:
+            return nil
+        }
+    }
+}
+
+/// Plays Apple Music catalog picks inside ZenAmp. On macOS MusicKit can't drive the
+/// Music app (SystemMusicPlayer is unavailable there), so ZenAmp plays them itself
+/// and the transport follows this player until Music starts playing again.
+@MainActor
+final class CatalogPlayer {
+    static let shared = CatalogPlayer()
+
+    enum Failure: Error { case notAuthorized, notFound }
+
+    private let player = ApplicationMusicPlayer.shared
+    /// True from a catalog pick until Music takes over again.
+    private(set) var isActive = false
+    /// Fires when the queue or playback state changes.
+    let changed = PassthroughSubject<Void, Never>()
+    private var subscriptions: Set<AnyCancellable> = []
+
+    private init() {
+        // objectWillChange fires before the change lands, so deliver on the next pass.
+        player.state.objectWillChange
+            .merge(with: player.queue.objectWillChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.changed.send() }
+            .store(in: &subscriptions)
+    }
+
+    /// A song plays on through the rest of its album, an album from the top,
+    /// and an artist through their top songs.
+    func play(_ result: CatalogResult) async throws {
+        guard let id = result.catalogID else { throw Failure.notFound }
+        if MusicAuthorization.currentStatus != .authorized {
+            guard await MusicAuthorization.request() == .authorized else { throw Failure.notAuthorized }
+        }
+        let itemID = MusicItemID(id)
+        switch result.kind {
+        case .song:
+            var request = MusicCatalogResourceRequest<Song>(matching: \.id, equalTo: itemID)
+            request.properties = [.albums]
+            guard let song = try await request.response().items.first else { throw Failure.notFound }
+            // Queue from the song to the end of its album. Queue(for:startingAt:) fails
+            // to prepare with album tracks ("unexpected start item"), so drop the head instead.
+            let rest = try await song.albums?.first?.with([.tracks]).tracks?.drop { $0.id != song.id }
+            if let rest, !rest.isEmpty {
+                player.queue = ApplicationMusicPlayer.Queue(for: Array(rest))
+            } else {
+                player.queue = [song]
+            }
+        case .album:
+            let request = MusicCatalogResourceRequest<Album>(matching: \.id, equalTo: itemID)
+            guard let album = try await request.response().items.first else { throw Failure.notFound }
+            player.queue = [album]
+        case .artist:
+            var request = MusicCatalogResourceRequest<Artist>(matching: \.id, equalTo: itemID)
+            request.properties = [.topSongs]
+            guard let songs = try await request.response().items.first?.topSongs, !songs.isEmpty else {
+                throw Failure.notFound
+            }
+            player.queue = ApplicationMusicPlayer.Queue(for: songs)
+        }
+        MusicController.pause()
+        isActive = true
+        do {
+            try await player.play()
+        } catch {
+            isActive = false
+            throw error
+        }
+        changed.send()
+    }
+
+    /// Hands the transport back to Music.
+    func deactivate() {
+        guard isActive else { return }
+        isActive = false
+        player.stop()
+    }
+
+    var isPlaying: Bool { player.state.playbackStatus == .playing }
+
+    func playPause() {
+        if isPlaying {
+            player.pause()
+        } else {
+            Task { try? await player.play() }
+        }
+    }
+
+    func next() { Task { try? await player.skipToNextEntry() } }
+
+    func previous() { Task { try? await player.skipToPreviousEntry() } }
+
+    func trackInfo() -> MusicController.TrackInfo? {
+        guard let entry = player.queue.currentEntry else { return nil }
+        var album = "APPLE MUSIC"
+        var duration: Double = 0
+        if case .song(let song) = entry.item {
+            album = song.albumTitle ?? album
+            duration = song.duration ?? 0
+        }
+        return MusicController.TrackInfo(
+            name: entry.title,
+            artist: entry.subtitle ?? "",
+            playlist: album,
+            isPlaying: isPlaying,
+            position: player.playbackTime,
+            duration: duration
+        )
+    }
+
+    func fetchArtwork(completion: @escaping (NSImage?) -> Void) {
+        guard let url = player.queue.currentEntry?.artwork?.url(width: 256, height: 256) else {
+            completion(nil)
+            return
+        }
+        Task {
+            let data = try? await URLSession.shared.data(from: url).0
+            completion(data.flatMap(NSImage.init(data:)))
+        }
+    }
+}
+
+/// Sends transport presses to whichever player is active.
+@MainActor
+enum Transport {
+    static func playPause(completion: @escaping () -> Void) {
+        if CatalogPlayer.shared.isActive {
+            CatalogPlayer.shared.playPause()
+            completion()
+        } else {
+            MusicController.playPause(completion: completion)
+        }
+    }
+
+    static func next(completion: @escaping () -> Void) {
+        // With the search panel open, NEXT/PREV walk the search results.
+        if AppState.shared.showSearch, SearchModel.shared.playAdjacent(1) {
+            completion()
+        } else if CatalogPlayer.shared.isActive {
+            CatalogPlayer.shared.next()
+            completion()
+        } else {
+            MusicController.nextTrack(completion: completion)
+        }
+    }
+
+    static func previous(completion: @escaping () -> Void) {
+        if AppState.shared.showSearch, SearchModel.shared.playAdjacent(-1) {
+            completion()
+        } else if CatalogPlayer.shared.isActive {
+            CatalogPlayer.shared.previous()
+            completion()
+        } else {
+            MusicController.previousTrack(completion: completion)
+        }
+    }
+}
+
+/// Search state lives here rather than in the panel so the query and results
+/// survive closing the panel, and the transport can step through results.
+@MainActor
+final class SearchModel: ObservableObject {
+    static let shared = SearchModel()
+
+    @Published var query = ""
+    @Published var scope: CatalogSearch.Scope = .all
+    @Published var results: [CatalogResult] = []
+    @Published var selection: Int?
+    @Published var status = "TYPE TO SEARCH APPLE MUSIC"
+    /// Bumped by the FIND button to focus the field and select its text.
+    @Published var focusRequest = 0
+    private var cache: [String: [CatalogResult]] = [:]
+    private var shownKey = ""
+
+    func search() async {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else {
+            shownKey = ""
+            show([], status: "TYPE TO SEARCH APPLE MUSIC")
+            return
+        }
+        let key = "\(scope.rawValue)|\(term.lowercased())"
+        // Reopening the panel reruns the search task; keep the list and selection as they were.
+        guard key != shownKey else { return }
+        if let cached = cache[key] {
+            shownKey = key
+            show(cached, status: summary(cached))
+            return
+        }
+        // Debounce: a keystroke within this window cancels the task before it searches.
+        do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
+        status = "SEARCHING…"
+        do {
+            let found = try await CatalogSearch.search(term, scope: scope)
+            guard !Task.isCancelled else { return }
+            cache[key] = found
+            shownKey = key
+            show(found, status: summary(found))
+        } catch CatalogSearch.Failure.rateLimited {
+            status = "APPLE RATE LIMIT — WAIT A FEW SECONDS"
+        } catch {
+            if !Task.isCancelled { status = "SEARCH FAILED" }
+        }
+    }
+
+    private func show(_ found: [CatalogResult], status newStatus: String) {
+        results = found
+        selection = found.first?.id
+        status = newStatus
+    }
+
+    private func summary(_ found: [CatalogResult]) -> String {
+        found.isEmpty ? "NO MATCHES" : "\(found.count) RESULT\(found.count == 1 ? "" : "S")"
+    }
+
+    func moveSelection(_ step: Int) {
+        guard !results.isEmpty else { return }
+        let current = results.firstIndex { $0.id == selection } ?? -step
+        let next = min(max(current + step, 0), results.count - 1)
+        selection = results[next].id
+    }
+
+    /// Plays the result `step` away from the selection. False when there's nothing to step to.
+    func playAdjacent(_ step: Int) -> Bool {
+        guard let current = results.firstIndex(where: { $0.id == selection }),
+              results.indices.contains(current + step) else { return false }
+        let result = results[current + step]
+        selection = result.id
+        play(result)
+        return true
+    }
+
+    func playSelection() {
+        if let result = results.first(where: { $0.id == selection }) { play(result) }
+    }
+
+    func play(_ result: CatalogResult) {
+        selection = result.id
+        status = "LOADING…"
+        Task {
+            do {
+                try await CatalogPlayer.shared.play(result)
+                status = "PLAYING IN ZENAMP"
+            } catch CatalogPlayer.Failure.notAuthorized {
+                status = "ALLOW APPLE MUSIC IN SYSTEM SETTINGS › PRIVACY"
+            } catch {
+                status = "COULDN'T PLAY THAT ONE"
+            }
+        }
+    }
+}
+
+struct SearchPanelView: View {
+    @Environment(\.uiScale) private var zoom
+    @Binding var isShowing: Bool
+    @ObservedObject private var model = SearchModel.shared
+    @FocusState private var fieldFocused: Bool
+
+    var theme: PlaylistTheme { .zenamp }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            titleBar
+            searchField
+            scopeBar
+            resultsList
+            bottomBar
+        }
+        .frame(width: 300 * zoom)
+        .background(theme.bg)
+        .border(theme.border, width: 1 * zoom)
+        .clipShape(RoundedRectangle(cornerRadius: 4 * zoom))
+        .onAppear(perform: focusField)
+        .onChange(of: model.focusRequest) { _, _ in focusField() }
+        // Restarts (cancelling the previous run) whenever the query or scope changes.
+        .task(id: "\(model.scope.rawValue)|\(model.query)") { await model.search() }
+    }
+
+    /// Focuses the field with its text selected, so typing replaces the last search.
+    private func focusField() {
+        fieldFocused = true
+        DispatchQueue.main.async {
+            NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: nil)
+        }
+    }
+
+    var titleBar: some View {
+        HStack {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 8 * zoom))
+            Text("SEARCH APPLE MUSIC")
+                .font(.system(size: 9 * zoom, weight: .bold, design: .monospaced))
+            Spacer()
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8 * zoom))
+                    .opacity(0.7)
+            }.buttonStyle(PlainButtonStyle())
+        }
+        .foregroundColor(theme.primary)
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 5 * zoom)
+        .background(LinearGradient(colors: [theme.titleBg1, theme.titleBg2], startPoint: .leading, endPoint: .trailing))
+    }
+
+    var searchField: some View {
+        TextField("", text: $model.query, prompt: Text("ARTIST, ALBUM OR SONG").foregroundColor(theme.primary.opacity(0.3)))
+            .textFieldStyle(.plain)
+            .font(.system(size: 10 * zoom, design: .monospaced))
+            .foregroundColor(theme.primary)
+            .focused($fieldFocused)
+            .padding(.horizontal, 6 * zoom)
+            .padding(.vertical, 4 * zoom)
+            .background(Color.black.opacity(0.6))
+            .overlay(RoundedRectangle(cornerRadius: 2 * zoom).stroke(theme.primary.opacity(0.3), lineWidth: 1 * zoom))
+            .padding(.horizontal, 6 * zoom)
+            .padding(.top, 6 * zoom)
+            .onSubmit { model.playSelection() }
+            .onKeyPress(.downArrow) { model.moveSelection(1); return .handled }
+            .onKeyPress(.upArrow) { model.moveSelection(-1); return .handled }
+            .onExitCommand {
+                if model.query.isEmpty { close() } else { model.query = "" }
+            }
+    }
+
+    var scopeBar: some View {
+        HStack(spacing: 10 * zoom) {
+            ForEach(CatalogSearch.Scope.allCases, id: \.self) { item in
+                Text(item.rawValue)
+                    .font(.system(size: 7 * zoom, weight: .bold, design: .monospaced))
+                    .foregroundColor(item == model.scope ? theme.secondary : theme.primary.opacity(0.45))
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.scope = item }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 5 * zoom)
+    }
+
+    var resultsList: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(model.results) { result in
+                        resultRow(result)
+                            .id(result.id)
+                    }
+                }
+            }
+            .background(theme.listBg)
+            .onAppear {
+                if let selected = model.selection { proxy.scrollTo(selected) }
+            }
+            .onChange(of: model.selection) { _, selected in
+                if let selected { proxy.scrollTo(selected) }
+            }
+        }
+    }
+
+    func resultRow(_ result: CatalogResult) -> some View {
+        let isSelected = result.id == model.selection
+        return HStack(alignment: .top, spacing: 6 * zoom) {
+            Text(result.mark)
+                .font(.system(size: 9 * zoom))
+                .foregroundColor(theme.secondary)
+                .frame(width: 10 * zoom)
+            VStack(alignment: .leading, spacing: 1 * zoom) {
+                Text(result.name.uppercased())
+                    .font(.system(size: 9 * zoom, design: .monospaced))
+                    .foregroundColor(isSelected ? theme.primary : theme.primary.opacity(0.8))
+                    .lineLimit(1)
+                if !result.detail.isEmpty {
+                    Text(result.detail.uppercased())
+                        .font(.system(size: 7 * zoom, design: .monospaced))
+                        .foregroundColor(theme.primary.opacity(0.45))
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 4 * zoom)
+            Text(result.extra.uppercased())
+                .font(.system(size: 7 * zoom, design: .monospaced))
+                .foregroundColor(theme.secondary.opacity(0.6))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 3 * zoom)
+        .background(isSelected ? theme.activeBg : (result.id % 2 == 0 ? theme.rowBg1 : theme.rowBg2))
+        .contentShape(Rectangle())
+        .onTapGesture { model.play(result) }
+    }
+
+    var bottomBar: some View {
+        HStack {
+            Text(model.status)
+                .font(.system(size: 7 * zoom, design: .monospaced))
+                .foregroundColor(theme.primary.opacity(0.6))
+                .lineLimit(1)
+            Spacer()
+            Text("↵ PLAY")
+                .font(.system(size: 7 * zoom, design: .monospaced))
+                .foregroundColor(theme.secondary.opacity(0.5))
+        }
+        .padding(.horizontal, 8 * zoom)
+        .padding(.vertical, 4 * zoom)
+        .background(theme.bottomBg)
+    }
+
+    private func close() {
+        withAnimation(.easeInOut(duration: 0.2)) { isShowing = false }
+    }
+}
+
 // MARK: - Winamp Skin View
 
 struct WinampView: View {
@@ -2205,22 +2760,22 @@ struct WinampView: View {
         HStack(spacing: 0) {
             // Previous
             winampButton(icon: "backward.fill", label: "PREV") {
-                MusicController.previousTrack { refreshTrackInfo() }
+                Transport.previous { refreshTrackInfo() }
             }
 
             // Play/Pause
             winampButton(icon: isPlaying ? "pause.fill" : "play.fill", label: isPlaying ? "PAUSE" : "PLAY", highlight: true) {
-                MusicController.playPause { refreshTrackInfo() }
+                Transport.playPause { refreshTrackInfo() }
             }
 
             // Next
             winampButton(icon: "forward.fill", label: "NEXT") {
-                MusicController.nextTrack { refreshTrackInfo() }
+                Transport.next { refreshTrackInfo() }
             }
 
             // Stop (rewind to beginning)
             winampButton(icon: "stop.fill", label: "STOP") {
-                MusicController.playPause { refreshTrackInfo() }
+                Transport.playPause { refreshTrackInfo() }
             }
 
             Spacer()
@@ -2239,6 +2794,19 @@ struct WinampView: View {
                 }
                 resizeWindow()
             }
+
+            // Apple Music search toggle
+            // Opens the search, or refocuses it if open; X or Esc closes it.
+            winampButton(icon: "magnifyingglass", label: "FIND", active: AppState.shared.showSearch) {
+                if AppState.shared.showSearch {
+                    SearchModel.shared.focusRequest += 1
+                } else {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        AppState.shared.showSearch = true
+                    }
+                    resizeWindow()
+                }
+            }
         }
         .padding(.horizontal, 6 * zoom)
         .padding(.vertical, 4 * zoom)
@@ -2253,7 +2821,7 @@ struct WinampView: View {
                     .font(.system(size: 6 * zoom, weight: .bold, design: .monospaced))
             }
             .foregroundColor(active ? winAmber : (highlight ? winGreen : winGreen.opacity(0.7)))
-            .frame(width: 42 * zoom, height: 32 * zoom)
+            .frame(width: 36 * zoom, height: 32 * zoom)
             .background(
                 RoundedRectangle(cornerRadius: 3 * zoom)
                     .fill(winMidBg)
@@ -2412,7 +2980,16 @@ class AppState: ObservableObject {
     static let shared = AppState()
     @Published var visualizerMode: VisualizerMode = .bars { didSet { savePrefs() } }
     @Published var showExpandedArt: Bool = false { didSet { savePrefs() } }
-    @Published var showPlaylist: Bool = false { didSet { savePrefs() } }
+    @Published var showPlaylist: Bool = false {
+        didSet {
+            savePrefs()
+            if showPlaylist { showSearch = false }
+        }
+    }
+    /// The search panel and playlist panel replace each other below the player.
+    @Published var showSearch: Bool = false {
+        didSet { if showSearch { showPlaylist = false } }
+    }
     @Published var zoomLevel: Double = 1.5 { didSet { savePrefs() } }
     /// False when the window is fully covered, hidden, or on another Space.
     @Published var isWindowVisible: Bool = true
